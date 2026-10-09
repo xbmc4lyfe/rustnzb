@@ -4,6 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
 import { MatDialog, MatDialogModule } from '@angular/material/dialog';
 import { GroupService } from '../../core/services/group.service';
+import { formatBytes } from '../../core/format';
 import { GroupRow, HeaderRow } from '../../core/models/group.model';
 import { GroupBrowserDialogComponent } from './group-browser-dialog.component';
 import { IconComponent } from '../../shared/icon.component';
@@ -579,10 +580,6 @@ export class GroupsViewComponent implements OnInit {
   }
 
   formatBytes(b: number): string {
-    if (b === 0) return '0 B';
-    const k = 1024;
-    const s = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.min(4, Math.floor(Math.log(b) / Math.log(k)));
-    return (b / Math.pow(k, i)).toFixed(1) + ' ' + s[i];
+    return formatBytes(b);
   }
 }

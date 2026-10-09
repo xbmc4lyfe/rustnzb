@@ -17,6 +17,12 @@ function createComponent(overrides: Record<string, ReturnType<typeof vi.fn>> = {
 }
 
 describe('RssViewComponent', () => {
+  it('formats item sizes of a terabyte and more (BUG-120)', () => {
+    const { component } = createComponent();
+    expect(component.formatBytes(1024 ** 4)).toBe('1.0 TB');
+    expect(component.formatBytes(0)).toBe('');
+  });
+
   it('loads all RSS resources and derives summary counts', () => {
     const { component } = createComponent({
       get: vi.fn((path: string) => of(path === '/config/rss-feeds'
