@@ -1,6 +1,19 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
-import { Observable, catchError, finalize, map, of, shareReplay, tap, throwError } from 'rxjs';
+import {
+  Observable,
+  catchError,
+  filter,
+  finalize,
+  fromEvent,
+  map,
+  of,
+  shareReplay,
+  take,
+  tap,
+  throwError,
+  timeout,
+} from 'rxjs';
 
 export interface AuthStatus {
   auth_enabled: boolean;
@@ -19,6 +32,9 @@ const REFRESH_KEY = 'refresh_token';
 const EXPIRES_KEY = 'access_token_expires_at';
 // Refresh slightly early so a token never expires between check and use.
 const EXPIRY_SKEW_MS = 30_000;
+// How long a rejected refresh waits for another tab, which may have spent the
+// same single-use refresh token first, to store the rotated tokens.
+const CROSS_TAB_REFRESH_GRACE_MS = 5_000;
 
 @Injectable({ providedIn: 'root' })
 export class AuthService {
@@ -32,6 +48,8 @@ export class AuthService {
   readonly authenticated = computed(() => !!this.accessToken() && this.verified());
 
   private refresh$: Observable<TokenResponse> | null = null;
+  /** Refresh token spent by this tab's most recent refresh attempt. */
+  private lastSpentRefresh: string | null = null;
   private verify$: Observable<boolean> | null = null;
 
   constructor(private http: HttpClient) {}
@@ -55,19 +73,74 @@ export class AuthService {
   /**
    * Rotate tokens. Concurrent callers share one in-flight request: refresh
    * tokens are single-use, so parallel refreshes would revoke each other.
+   *
+   * Other tabs share localStorage but not this in-flight request, so two tabs
+   * can spend the same refresh token. The loser's rejection is not a dead
+   * session when the winner has stored (or shortly stores) newer tokens:
+   * adopt those instead of failing.
    */
   refresh(): Observable<TokenResponse> {
     if (!this.refresh$) {
       const refreshToken = localStorage.getItem(REFRESH_KEY);
+      this.lastSpentRefresh = refreshToken;
       this.refresh$ = this.http
         .post<TokenResponse>(`${this.baseUrl}/refresh`, { refresh_token: refreshToken })
         .pipe(
           tap((res) => this.storeTokens(res)),
+          catchError((err) => this.adoptTokensRotatedElsewhere(refreshToken, err)),
           finalize(() => (this.refresh$ = null)),
           shareReplay({ bufferSize: 1, refCount: false }),
         );
     }
     return this.refresh$;
+  }
+
+  /**
+   * After a failed refresh: clear the session only if the stored refresh
+   * token is still the one that failed. Returns false when another tab has
+   * stored newer tokens in the meantime (callers should retry with those).
+   */
+  discardFailedSession(): boolean {
+    const stored = localStorage.getItem(REFRESH_KEY);
+    if (stored && stored !== this.lastSpentRefresh && this.getAccessToken()) {
+      this.accessToken.set(this.getAccessToken());
+      return false;
+    }
+    this.clearTokens();
+    return true;
+  }
+
+  private adoptTokensRotatedElsewhere(spent: string | null, err: unknown): Observable<TokenResponse> {
+    const rejected =
+      err instanceof HttpErrorResponse && (err.status === 401 || err.status === 403);
+    if (!rejected) return throwError(() => err);
+    const stored = this.rotatedTokens(spent);
+    if (stored) return of(stored);
+    if (typeof window === 'undefined') return throwError(() => err);
+    // The other tab's refresh may still be in flight: its write fires a
+    // 'storage' event here (storeTokens writes the access token first).
+    return fromEvent<StorageEvent>(window, 'storage').pipe(
+      map(() => this.rotatedTokens(spent)),
+      filter((tokens): tokens is TokenResponse => tokens !== null),
+      take(1),
+      timeout({ first: CROSS_TAB_REFRESH_GRACE_MS, with: () => throwError(() => err) }),
+    );
+  }
+
+  /** Tokens in storage if they differ from the refresh token we spent. */
+  private rotatedTokens(spent: string | null): TokenResponse | null {
+    const access = localStorage.getItem(ACCESS_KEY);
+    const refresh = localStorage.getItem(REFRESH_KEY);
+    if (!access || !refresh || refresh === spent) return null;
+    this.accessToken.set(access);
+    this.verified.set(true);
+    const expiresAt = Number(localStorage.getItem(EXPIRES_KEY));
+    return {
+      access_token: access,
+      refresh_token: refresh,
+      token_type: 'Bearer',
+      expires_in: expiresAt ? Math.max(0, Math.floor((expiresAt - Date.now()) / 1000)) : 0,
+    };
   }
 
   logout(): Observable<void> {
@@ -85,6 +158,7 @@ export class AuthService {
     if (!this.getAccessToken()) return of(false);
     if (this.verified()) return of(true);
     if (!this.verify$) {
+      const probed = this.getAccessToken();
       const probe$: Observable<unknown> = this.accessTokenExpired()
         ? this.refresh()
         : this.http.get('/api/status');
@@ -93,8 +167,10 @@ export class AuthService {
         catchError((err) => {
           const rejected =
             err instanceof HttpErrorResponse && (err.status === 401 || err.status === 403);
-          if (rejected) this.clearTokens();
-          return of(!rejected);
+          // Another tab may have replaced the rejected tokens meanwhile.
+          const replaced = this.getAccessToken() !== probed;
+          if (rejected && !replaced) this.clearTokens();
+          return of(!rejected || replaced);
         }),
         map((ok) => ok && this.isLoggedIn()),
         tap((ok) => this.verified.set(ok)),

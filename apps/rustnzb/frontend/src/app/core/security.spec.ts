@@ -9,7 +9,7 @@ import {
 import { TestBed } from '@angular/core/testing';
 import { Router } from '@angular/router';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Observable, Subject, firstValueFrom, of, throwError } from 'rxjs';
+import { Observable, Subject, defer, firstValueFrom, of, throwError } from 'rxjs';
 
 import { authGuard } from './guards/auth.guard';
 import { authInterceptor } from './interceptors/auth.interceptor';
@@ -52,6 +52,7 @@ describe('authInterceptor', () => {
       getAccessToken: vi.fn(() => token),
       refresh: vi.fn(() => refreshResult),
       clearTokens: vi.fn(),
+      discardFailedSession: vi.fn(() => true),
       setToken: (t: string | null) => (token = t),
     };
     const router = { navigate: vi.fn(() => Promise.resolve(true)) };
@@ -154,7 +155,26 @@ describe('authInterceptor', () => {
     await expect(
       firstValueFrom(intercept(new HttpRequest('GET', '/api/queue'), next as HttpHandlerFn)),
     ).rejects.toMatchObject({ status: 403 });
-    expect(auth.clearTokens).toHaveBeenCalledTimes(1);
+    expect(auth.discardFailedSession).toHaveBeenCalledTimes(1);
     expect(router.navigate).toHaveBeenCalledWith(['/login']);
+  });
+
+  it('retries with tokens another tab stored when its own refresh failed (BUG-123)', async () => {
+    const { auth, router } = configure(
+      defer(() => {
+        auth.setToken('tab-b-access');
+        return throwError(() => new HttpErrorResponse({ status: 401 }));
+      }),
+    );
+    auth.discardFailedSession.mockReturnValue(false);
+    const next = vi.fn((req: HttpRequest<unknown>) =>
+      req.headers.get('Authorization') === 'Bearer tab-b-access' ? ok() : unauthorized(),
+    );
+
+    await firstValueFrom(intercept(new HttpRequest('GET', '/api/queue'), next as HttpHandlerFn));
+
+    expect(authHeader(next, 1)).toBe('Bearer tab-b-access');
+    expect(auth.clearTokens).not.toHaveBeenCalled();
+    expect(router.navigate).not.toHaveBeenCalled();
   });
 });

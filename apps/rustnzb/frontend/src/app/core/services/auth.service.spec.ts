@@ -1,8 +1,8 @@
 import '@angular/compiler';
 
 import { HttpClient, HttpErrorResponse } from '@angular/common/http';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { Subject, firstValueFrom, of, throwError } from 'rxjs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Subject, defer, firstValueFrom, of, throwError } from 'rxjs';
 
 import { AuthService, TokenResponse } from './auth.service';
 
@@ -137,5 +137,92 @@ describe('AuthService', () => {
     expect(service.authenticated()).toBe(true);
     service.clearTokens();
     expect(service.authenticated()).toBe(false);
+  });
+
+  describe('cross-tab refresh (BUG-123)', () => {
+    const rejected = () => new HttpErrorResponse({ status: 401 });
+    /** Simulates another tab finishing its refresh: it writes localStorage. */
+    function otherTabStores(access: string, refresh: string, notify = false): void {
+      localStorage.setItem('access_token', access);
+      localStorage.setItem('refresh_token', refresh);
+      if (notify) {
+        window.dispatchEvent(new StorageEvent('storage', { key: 'refresh_token', newValue: refresh }));
+      }
+    }
+
+    beforeEach(() => {
+      localStorage.setItem('access_token', 'old-access');
+      localStorage.setItem('refresh_token', 'old-refresh');
+      service = new AuthService(http as unknown as HttpClient);
+    });
+
+    afterEach(() => vi.useRealTimers());
+
+    it('adopts tokens another tab already rotated instead of failing', async () => {
+      // Both tabs spent old-refresh; the other tab won and stored its result
+      // before this tab's rejection came back.
+      http.post.mockReturnValue(
+        defer(() => {
+          otherTabStores('tab-b-access', 'tab-b-refresh');
+          return throwError(rejected);
+        }),
+      );
+
+      const tokens = await firstValueFrom(service.refresh());
+
+      expect(tokens.access_token).toBe('tab-b-access');
+      expect(service.getAccessToken()).toBe('tab-b-access');
+      expect(localStorage.getItem('refresh_token')).toBe('tab-b-refresh');
+    });
+
+    it('waits briefly for a refresh still in flight in another tab', async () => {
+      const response = new Subject<TokenResponse>();
+      http.post.mockReturnValue(response);
+      const result = firstValueFrom(service.refresh());
+
+      response.error(rejected());
+      otherTabStores('tab-b-access', 'tab-b-refresh', true);
+
+      await expect(result).resolves.toMatchObject({ access_token: 'tab-b-access' });
+      expect(localStorage.getItem('refresh_token')).toBe('tab-b-refresh');
+    });
+
+    it('still fails when no other tab rotated the tokens', async () => {
+      vi.useFakeTimers();
+      http.post.mockReturnValue(throwError(rejected));
+      const result = firstValueFrom(service.refresh());
+      const outcome = expect(result).rejects.toMatchObject({ status: 401 });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await outcome;
+      expect(service.discardFailedSession()).toBe(true);
+      expect(localStorage.getItem('access_token')).toBeNull();
+    });
+
+    it('keeps a session another tab replaced while the probe was rejected', async () => {
+      http.get.mockReturnValue(
+        defer(() => {
+          otherTabStores('tab-b-access', 'tab-b-refresh');
+          return throwError(rejected);
+        }),
+      );
+
+      await expect(firstValueFrom(service.ensureSession())).resolves.toBe(true);
+      expect(service.getAccessToken()).toBe('tab-b-access');
+    });
+
+    it('only clears tokens that are still the ones that failed', async () => {
+      vi.useFakeTimers();
+      http.post.mockReturnValue(throwError(rejected));
+      const result = firstValueFrom(service.refresh());
+      const outcome = expect(result).rejects.toMatchObject({ status: 401 });
+      await vi.advanceTimersByTimeAsync(10_000);
+      await outcome;
+      // Another tab logged in / refreshed after this tab gave up waiting.
+      otherTabStores('tab-b-access', 'tab-b-refresh');
+
+      expect(service.discardFailedSession()).toBe(false);
+      expect(service.getAccessToken()).toBe('tab-b-access');
+      expect(localStorage.getItem('refresh_token')).toBe('tab-b-refresh');
+    });
   });
 });
