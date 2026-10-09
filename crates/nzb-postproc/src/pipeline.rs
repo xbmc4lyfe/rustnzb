@@ -123,6 +123,11 @@ pub struct PostProcResult {
 pub struct PostProcConfig {
     /// Remove par2 and archive files after successful extraction.
     pub cleanup_after_extract: bool,
+    /// Whether cleanup removes the archive volumes it extracted. When false
+    /// (SABnzbd `pp=2`, "+Unpack" without "+Delete") the archives are kept
+    /// and cleanup only removes PAR2 files and the category's cleanup
+    /// patterns / unwanted extensions.
+    pub delete_archives: bool,
     /// Directory where extracted files should be placed.
     /// If None, extracts into the job directory itself.
     pub output_dir: Option<PathBuf>,
@@ -148,6 +153,7 @@ impl Default for PostProcConfig {
     fn default() -> Self {
         Self {
             cleanup_after_extract: true,
+            delete_archives: true,
             output_dir: None,
             articles_failed: 0,
             content_articles_failed: 0,
@@ -189,6 +195,38 @@ pub async fn run_pipeline_with_cleanup(
     resources: Option<&Arc<PostProcResourcePool>>,
     cleanup_patterns: &[String],
     unwanted_extensions: &[String],
+) -> PostProcResult {
+    run_stages(
+        job_dir,
+        config,
+        resources,
+        cleanup_patterns,
+        unwanted_extensions,
+        true,
+    )
+    .await
+}
+
+/// Run only PAR2 verification and repair, without extraction or cleanup.
+///
+/// This is SABnzbd's "repair only" post-processing level (`pp=1`): the
+/// archives themselves are the job's output, so they are neither unpacked
+/// nor removed.
+pub async fn run_repair_pipeline(
+    job_dir: &Path,
+    config: &PostProcConfig,
+    resources: Option<&Arc<PostProcResourcePool>>,
+) -> PostProcResult {
+    run_stages(job_dir, config, resources, &[], &[], false).await
+}
+
+async fn run_stages(
+    job_dir: &Path,
+    config: &PostProcConfig,
+    resources: Option<&Arc<PostProcResourcePool>>,
+    cleanup_patterns: &[String],
+    unwanted_extensions: &[String],
+    unpack: bool,
 ) -> PostProcResult {
     let mut stages: Vec<StageResult> = Vec::new();
     let mut pipeline_ok = true;
@@ -451,7 +489,7 @@ pub async fn run_pipeline_with_cleanup(
     // Extraction is safe only after verification/repair succeeded (or source
     // content was already known-good). Confirmed unrepaired content damage
     // must not be mistaken for a successful archive.
-    let should_extract = pipeline_ok;
+    let should_extract = unpack && pipeline_ok;
     let mut extracted_archives = Vec::new();
     if should_extract {
         let output_dir = config.output_dir.as_deref().unwrap_or(job_dir);
@@ -502,7 +540,7 @@ pub async fn run_pipeline_with_cleanup(
     // ------------------------------------------------------------------
     // Stage 4: Cleanup
     // ------------------------------------------------------------------
-    if pipeline_ok && config.cleanup_after_extract {
+    if unpack && pipeline_ok && config.cleanup_after_extract {
         let cleanup_root = config.output_dir.as_deref().unwrap_or(job_dir);
         let result = run_cleanup_stage_with_rules(
             job_dir,
@@ -510,6 +548,7 @@ pub async fn run_pipeline_with_cleanup(
             &extracted_archives,
             cleanup_patterns,
             unwanted_extensions,
+            config.delete_archives,
         );
         stages.push(result);
     }
@@ -812,7 +851,7 @@ async fn run_extract_stage(
 
 #[cfg(test)]
 fn run_cleanup_stage(job_dir: &Path, extracted_archives: &[PathBuf]) -> StageResult {
-    run_cleanup_stage_with_rules(job_dir, job_dir, extracted_archives, &[], &[])
+    run_cleanup_stage_with_rules(job_dir, job_dir, extracted_archives, &[], &[], true)
 }
 
 fn wildcard_match(pattern: &str, value: &str) -> bool {
@@ -852,19 +891,29 @@ fn run_cleanup_stage_with_rules(
     extracted_archives: &[PathBuf],
     cleanup_patterns: &[String],
     unwanted_extensions: &[String],
+    delete_archives: bool,
 ) -> StageResult {
     let start = Instant::now();
     let mut files = find_cleanup_files(job_dir);
-    files.extend(
-        extracted_archives
-            .iter()
-            .filter(|path| {
-                std::fs::symlink_metadata(path)
-                    .map(|metadata| metadata.file_type().is_file())
-                    .unwrap_or(false)
-            })
-            .cloned(),
-    );
+    if delete_archives {
+        files.extend(
+            extracted_archives
+                .iter()
+                .filter(|path| {
+                    std::fs::symlink_metadata(path)
+                        .map(|metadata| metadata.file_type().is_file())
+                        .unwrap_or(false)
+                })
+                .cloned(),
+        );
+    } else {
+        // Keep the archive set; PAR2 recovery files are still removed, as
+        // SABnzbd does after a successful verify regardless of "+Delete".
+        files.retain(|path| {
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("par2"))
+        });
+    }
 
     let normalized_extensions: Vec<String> = unwanted_extensions
         .iter()
@@ -1118,6 +1167,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repair_pipeline_neither_extracts_nor_cleans_up() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let archive = source.path().join("release.zip");
+        write_zip(&archive, &[("payload.txt", b"payload")]);
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            ..Default::default()
+        };
+        let result = run_repair_pipeline(source.path(), &config, None).await;
+
+        assert!(result.success, "{result:?}");
+        assert!(
+            result
+                .stages
+                .iter()
+                .all(|stage| stage.name != "Extract" && stage.name != "Cleanup"),
+            "{:?}",
+            result.stages
+        );
+        assert!(archive.exists());
+        assert!(!output.path().join("payload.txt").exists());
+    }
+
+    #[tokio::test]
     async fn recursive_cleanup_removes_nested_archives_from_output_directory() {
         let source = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
@@ -1230,6 +1305,61 @@ mod tests {
         );
         assert_eq!(fs::read(output.path().join("movie.mkv")).unwrap(), b"movie");
         assert!(!subs.exists());
+    }
+
+    #[tokio::test]
+    async fn keep_archives_preserves_unpacked_rar_set_and_removes_par2() {
+        // SABnzbd pp=2 ("+Unpack" without "+Delete"): the RAR set is unpacked
+        // (here by direct unpack) but its volumes must survive cleanup.
+        let job_dir = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let volumes = ["movie.part01.rar", "movie.part02.rar", "movie.r00"];
+        for volume in volumes {
+            fs::write(job_dir.path().join(volume), b"Rar!\x1a\x07\x01\x00 volume").unwrap();
+        }
+        fs::write(job_dir.path().join("movie.par2"), b"par2").unwrap();
+        fs::write(output.path().join("movie.mkv"), b"movie").unwrap();
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            skip_extract: true,
+            delete_archives: false,
+            ..Default::default()
+        };
+        let result = run_pipeline(job_dir.path(), &config).await;
+
+        assert!(result.success, "{result:?}");
+        for volume in volumes {
+            assert!(job_dir.path().join(volume).exists(), "{volume} was deleted");
+        }
+        assert!(!job_dir.path().join("movie.par2").exists());
+        assert_eq!(fs::read(output.path().join("movie.mkv")).unwrap(), b"movie");
+    }
+
+    #[tokio::test]
+    async fn keep_archives_preserves_extracted_zip_and_nested_archives() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let inner = source.path().join("inner.zip");
+        write_zip(&inner, &[("payload.txt", b"nested payload")]);
+        let outer = source.path().join("outer.zip");
+        write_zip(&outer, &[("inner.zip", &fs::read(&inner).unwrap())]);
+        fs::remove_file(inner).unwrap();
+
+        let config = PostProcConfig {
+            output_dir: Some(output.path().to_path_buf()),
+            delete_archives: false,
+            ..Default::default()
+        };
+        let result = run_pipeline(source.path(), &config).await;
+
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            fs::read(output.path().join("payload.txt")).unwrap(),
+            b"nested payload"
+        );
+        assert!(outer.exists());
+        assert!(output.path().join("inner.zip").exists());
     }
 
     #[tokio::test]

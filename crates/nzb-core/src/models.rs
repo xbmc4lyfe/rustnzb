@@ -190,6 +190,11 @@ pub struct NzbJob {
     /// `None` uses the category setting.
     #[serde(default)]
     pub pp_override: Option<u8>,
+    /// Whether a successful unpack deletes the archive volumes it extracted.
+    /// `Some(false)` keeps them (SABnzbd `pp=2`, "+Unpack" without
+    /// "+Delete"); `None` or `Some(true)` deletes them, the default.
+    #[serde(default)]
+    pub delete_archives: Option<bool>,
     /// Files in this job
     #[serde(skip)]
     pub files: Vec<NzbFile>,
@@ -249,6 +254,16 @@ pub struct HistoryEntry {
     pub stages: Vec<StageResult>,
     pub error_message: Option<String>,
     pub failure_code: Option<JobFailureCode>,
+    /// Effective post-processing level the job ran with (0=none, 1=repair,
+    /// 2=unpack, 3=repair+unpack). `None` for rows recorded before it was
+    /// stored.
+    #[serde(default)]
+    pub post_processing: Option<u8>,
+    /// The job's [`NzbJob::delete_archives`] flag, so history reports an
+    /// unpack that kept its archives. `None` for rows recorded before it was
+    /// stored, or when the default (delete) applied.
+    #[serde(default)]
+    pub delete_archives: Option<bool>,
     /// Per-server download statistics
     #[serde(default)]
     pub server_stats: Vec<ServerArticleStats>,

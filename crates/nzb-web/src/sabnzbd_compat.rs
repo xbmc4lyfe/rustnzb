@@ -289,6 +289,7 @@ async fn handle_addurl(
                 job.password = Some(pw.clone());
             }
             job.pp_override = sab_pp_override(pp.as_deref());
+            job.delete_archives = sab_pp_delete_archives(pp.as_deref());
 
             let qm = &state.queue_manager;
             job.work_dir = qm.incomplete_dir().join(&job.id);
@@ -739,6 +740,7 @@ async fn dispatch_post(
                         job.password = Some(pw.clone());
                     }
                     job.pp_override = sab_pp_override(query_req.pp.as_deref());
+                    job.delete_archives = sab_pp_delete_archives(query_req.pp.as_deref());
 
                     let qm = &state.queue_manager;
                     job.work_dir = qm.incomplete_dir().join(&job.id);
@@ -1171,7 +1173,10 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     let speed_bps = qm.get_speed();
     let speed_limit_bps = qm.get_speed_limit();
 
-    let mut response = build_queue_response(&jobs, paused, speed_bps, speed_limit_bps, req);
+    let mut response =
+        build_queue_response(&jobs, paused, speed_bps, speed_limit_bps, req, |job| {
+            qm.post_processing_level(job)
+        });
     let queue = &mut response["queue"];
     // Seconds left of a timed pause (POST /api/queue/pause-for), else "0".
     queue["pause_int"] =
@@ -1255,6 +1260,7 @@ fn build_queue_response(
     speed_bps: u64,
     speed_limit_bps: u64,
     req: &SabApiRequest,
+    pp_level: impl Fn(&NzbJob) -> u8,
 ) -> serde_json::Value {
     let start = req.start.unwrap_or(0);
     let limit = req.limit.unwrap_or(0);
@@ -1315,7 +1321,14 @@ fn build_queue_response(
             if queue_totals_include(job) {
                 running_bytes = running_bytes.saturating_add(remaining_bytes(job));
             }
-            SabQueueSlot::from_job(job, start + offset, paused, running_bytes, speed_bps)
+            SabQueueSlot::from_job(
+                job,
+                start + offset,
+                paused,
+                running_bytes,
+                speed_bps,
+                pp_level(job),
+            )
         })
         .collect();
 
@@ -1588,6 +1601,10 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
                     | JobStatus::PostProcessing
             )
         })
+        .map(|job| {
+            let level = qm.post_processing_level(&job);
+            (job, level)
+        })
         .collect();
 
     Json(build_history_response(
@@ -1600,13 +1617,13 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
 
 fn build_history_response(
     entries: &[HistoryEntry],
-    postprocessing: &[NzbJob],
+    postprocessing: &[(NzbJob, u8)],
     req: &SabApiRequest,
     history_update: u64,
 ) -> serde_json::Value {
     let mut slots: Vec<SabHistorySlot> = postprocessing
         .iter()
-        .map(SabHistorySlot::from_postprocessing)
+        .map(|(job, level)| SabHistorySlot::from_postprocessing(job, *level))
         .chain(entries.iter().map(SabHistorySlot::from_entry))
         .filter(|slot| history_slot_matches(slot, req))
         .collect();
@@ -2376,6 +2393,27 @@ fn sab_pp_override(pp: Option<&str>) -> Option<u8> {
     }
 }
 
+/// The archive-deletion flag for SABnzbd's `pp`: 2 (+repair/unpack) keeps
+/// the archives, 3 (+delete) removes them. Other values leave the default.
+fn sab_pp_delete_archives(pp: Option<&str>) -> Option<bool> {
+    match pp?.trim().parse::<i32>().ok()? {
+        2 => Some(false),
+        3 => Some(true),
+        _ => None,
+    }
+}
+
+/// The SABnzbd-scale level reported for a RustNZB level: an unpacking job
+/// that keeps its archives is SABnzbd's 2 (+repair/unpack without +delete),
+/// so `pp=2` reads back as `unpackopts` "2" and history `pp` "U".
+fn sab_reported_level(level: u8, delete_archives: Option<bool>) -> u8 {
+    if level >= 2 && delete_archives == Some(false) {
+        2
+    } else {
+        level
+    }
+}
+
 /// Convert arr-protocol priority string to our Priority enum.
 fn sab_priority_to_priority(s: &str) -> Priority {
     match s.trim() {
@@ -2425,6 +2463,7 @@ impl SabQueueSlot {
         globally_paused: bool,
         running_bytes: u64,
         speed_bps: u64,
+        pp_level: u8,
     ) -> Self {
         let mb = job.total_bytes as f64 / 1_048_576.0;
         let mbleft = remaining_bytes(job) as f64 / 1_048_576.0;
@@ -2438,7 +2477,7 @@ impl SabQueueSlot {
         Self {
             index,
             nzo_id: queue_nzo_id(job),
-            unpackopts: "3".into(),
+            unpackopts: sab_unpackopts(sab_reported_level(pp_level, job.delete_archives)).into(),
             script: "None".into(),
             filename: job.name.clone(),
             labels: Vec::new(),
@@ -2510,6 +2549,32 @@ fn sab_queue_status(status: JobStatus) -> &'static str {
     }
 }
 
+/// SABnzbd's queue `unpackopts` for an effective post-processing level: the
+/// level as a string, on the scale `pp` is accepted on (see
+/// [`sab_pp_override`]) and history reports (see [`sab_pp_label`]), so a job
+/// re-added with its reported `unpackopts` keeps its level. Out-of-range
+/// levels fall back to the default, 3.
+fn sab_unpackopts(level: u8) -> &'static str {
+    match level {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        _ => "3",
+    }
+}
+
+/// SABnzbd's history `pp` label for an effective post-processing level
+/// (`sabnzbd/constants.py::PP_LOOKUP`); unknown levels map to `"X"` as there.
+fn sab_pp_label(level: u8) -> &'static str {
+    match level {
+        0 => "",
+        1 => "R",
+        2 => "U",
+        3 => "D",
+        _ => "X",
+    }
+}
+
 #[derive(Serialize)]
 struct SabHistorySlot {
     completed: i64,
@@ -2572,7 +2637,13 @@ impl SabHistorySlot {
             name: entry.name.clone(),
             nzb_name: format!("{}.nzb", entry.name),
             category: sab_category_label(&entry.category),
-            pp: "D".into(),
+            // Rows written before the level was recorded keep reporting "D".
+            pp: entry
+                .post_processing
+                .map_or("D", |level| {
+                    sab_pp_label(sab_reported_level(level, entry.delete_archives))
+                })
+                .into(),
             script: String::new(),
             report: String::new(),
             url: String::new(),
@@ -2619,7 +2690,7 @@ impl SabHistorySlot {
         }
     }
 
-    fn from_postprocessing(job: &NzbJob) -> Self {
+    fn from_postprocessing(job: &NzbJob, pp_level: u8) -> Self {
         let path = job.work_dir.to_string_lossy().to_string();
         Self {
             completed: job
@@ -2629,7 +2700,7 @@ impl SabHistorySlot {
             name: job.name.clone(),
             nzb_name: format!("{}.nzb", job.name),
             category: sab_category_label(&job.category),
-            pp: "D".into(),
+            pp: sab_pp_label(sab_reported_level(pp_level, job.delete_archives)).into(),
             script: String::new(),
             report: String::new(),
             url: String::new(),
@@ -2835,6 +2906,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -2867,6 +2939,8 @@ mod tests {
             }],
             error_message: (status == JobStatus::Failed).then(|| "broken archive".into()),
             failure_code: (status == JobStatus::Failed).then_some(JobFailureCode::ArchiveInvalid),
+            post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: (status == JobStatus::Failed).then(Vec::new),
             retry_data: None,
@@ -2896,6 +2970,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -2934,6 +3009,7 @@ mod tests {
             1_048_576,
             2_097_152,
             &SabApiRequest::default(),
+            |_| 3,
         );
         let queue = &response["queue"];
         let slot = &queue["slots"][0];
@@ -2948,7 +3024,7 @@ mod tests {
 
         assert_eq!(slot["index"], 0);
         assert_eq!(slot["nzo_id"], "SABnzbd_nzo_1234567890ab");
-        assert_eq!(slot["unpackopts"], "3");
+        assert!(slot["unpackopts"].is_string());
         assert_eq!(slot["script"], "None");
         assert_eq!(slot["labels"], serde_json::json!([]));
         assert_eq!(slot["password"], "secret");
@@ -2965,6 +3041,7 @@ mod tests {
             0,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(response["queue"]["status"], "Idle");
         assert_eq!(response["queue"]["timeleft"], "0:00:00");
@@ -2985,6 +3062,7 @@ mod tests {
             0,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(response["queue"]["status"], "Downloading");
 
@@ -2999,13 +3077,14 @@ mod tests {
             0,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(paused["queue"]["status"], "Paused");
     }
 
     #[test]
     fn empty_and_paused_queues_have_sab_statuses() {
-        let empty = build_queue_response(&[], false, 0, 0, &SabApiRequest::default());
+        let empty = build_queue_response(&[], false, 0, 0, &SabApiRequest::default(), |_| 3);
         assert_eq!(empty["queue"]["status"], "Idle");
         assert_eq!(empty["queue"]["slots"], serde_json::json!([]));
         assert_eq!(empty["queue"]["noofslots_total"], 0);
@@ -3016,6 +3095,7 @@ mod tests {
             1_048_576,
             0,
             &SabApiRequest::default(),
+            |_| 3,
         );
         assert_eq!(paused["queue"]["status"], "Paused");
         assert_eq!(paused["queue"]["slots"][0]["timeleft"], "0:00:00");
@@ -3068,7 +3148,7 @@ mod tests {
             limit: Some(1),
             ..SabApiRequest::default()
         };
-        let response = build_queue_response(&jobs, false, 0, 0, &req);
+        let response = build_queue_response(&jobs, false, 0, 0, &req, |_| 3);
         let queue = &response["queue"];
 
         assert_eq!(queue["noofslots_total"], 4);
@@ -3092,7 +3172,7 @@ mod tests {
             nzo_ids: Some("SABnzbd_nzo_high-priorit".into()),
             ..SabApiRequest::default()
         };
-        let response = build_queue_response(&[high, normal], false, 0, 0, &req);
+        let response = build_queue_response(&[high, normal], false, 0, 0, &req, |_| 3);
 
         assert_eq!(response["queue"]["noofslots"], 1);
         assert_eq!(response["queue"]["slots"][0]["filename"], "First");
@@ -3115,6 +3195,8 @@ mod tests {
             stages: Vec::new(),
             error_message: None,
             failure_code: None,
+            post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -3189,6 +3271,122 @@ mod tests {
         assert!(slots[0]["completeness"].is_null());
     }
 
+    /// SABnzbd's queue `unpackopts` is the job's post-processing level as a
+    /// string, on the same scale `pp` is accepted on and history reports.
+    #[test]
+    fn queue_slot_unpackopts_reflects_the_effective_level() {
+        for level in 0..=3_u8 {
+            let jobs = vec![queue_job("upk", "Upk", "tv", JobStatus::Queued)];
+            let response =
+                build_queue_response(&jobs, false, 0, 0, &SabApiRequest::default(), |_| level);
+            assert_eq!(
+                response["queue"]["slots"][0]["unpackopts"],
+                level.to_string(),
+                "level {level}"
+            );
+        }
+    }
+
+    /// A job added with SABnzbd `pp=2` (repair+unpack, keep the archives)
+    /// reports `unpackopts` "2" in the queue and `pp` "U" in history, so a
+    /// client re-adding it with what it reads back gets the same behaviour.
+    #[tokio::test]
+    async fn addfile_pp2_reports_unpack_without_delete() {
+        let job = addfile_multipart(SabApiRequest::default(), &[("pp", "2")]).await;
+        assert_eq!(job.delete_archives, Some(false));
+        let level = job.pp_override.expect("pp override");
+
+        let queue = build_queue_response(
+            std::slice::from_ref(&job),
+            false,
+            0,
+            0,
+            &SabApiRequest::default(),
+            |_| level,
+        );
+        assert_eq!(queue["queue"]["slots"][0]["unpackopts"], "2");
+
+        let running =
+            build_history_response(&[], &[(job.clone(), level)], &SabApiRequest::default(), 1);
+        assert_eq!(running["history"]["slots"][0]["pp"], "U");
+
+        let mut entry = history_entry("keep", "Keep", "movies", JobStatus::Completed, 1);
+        entry.post_processing = Some(level);
+        entry.delete_archives = job.delete_archives;
+        assert_eq!(SabHistorySlot::from_entry(&entry).pp, "U");
+        // The default (delete) still reports "D".
+        entry.delete_archives = Some(true);
+        assert_eq!(SabHistorySlot::from_entry(&entry).pp, "D");
+    }
+
+    /// The live queue resolves the level from the job's `pp` override, else
+    /// its category.
+    #[tokio::test]
+    async fn queue_unpackopts_uses_job_override_then_category() {
+        let test_state = test_state();
+        test_state
+            .state
+            .queue_manager
+            .set_categories(vec![CategoryConfig {
+                name: "unpackonly".into(),
+                post_processing: 2,
+                ..CategoryConfig::default()
+            }]);
+        add_live_job_with_category(&test_state, "upk-category", "unpackonly");
+        let mut job = queue_job("upk-override", "Override", "unpackonly", JobStatus::Queued);
+        job.pp_override = Some(0);
+        let general = &test_state.state.config().general;
+        job.work_dir = general.incomplete_dir.join("upk-override");
+        job.output_dir = general.complete_dir.join("upk-override");
+        test_state
+            .state
+            .queue_manager
+            .add_job(job, None)
+            .expect("add override job");
+
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        let slots = queue["queue"]["slots"].as_array().expect("slots");
+        let unpackopts = |nzo_id: &str| {
+            slots
+                .iter()
+                .find(|slot| {
+                    slot["nzo_id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(nzo_id))
+                })
+                .map(|slot| slot["unpackopts"].clone())
+                .expect("slot present")
+        };
+        assert_eq!(unpackopts("SABnzbd_nzo_upk-category"), "2");
+        assert_eq!(unpackopts("SABnzbd_nzo_upk-override"), "0");
+    }
+
+    /// SABnzbd reports the job's post-processing level as
+    /// `PP_LOOKUP = {0: "", 1: "R", 2: "U", 3: "D"}`.
+    #[test]
+    fn history_slot_pp_reflects_the_effective_level() {
+        for (level, label) in [(0, ""), (1, "R"), (2, "U"), (3, "D")] {
+            let mut entry = history_entry("pp", "PP", "movies", JobStatus::Completed, 1);
+            entry.post_processing = Some(level);
+            assert_eq!(
+                SabHistorySlot::from_entry(&entry).pp,
+                label,
+                "level {level}"
+            );
+        }
+        // Rows recorded before the level was stored keep the old answer.
+        let legacy = history_entry("legacy", "Legacy", "movies", JobStatus::Completed, 1);
+        assert_eq!(SabHistorySlot::from_entry(&legacy).pp, "D");
+
+        let response = build_history_response(
+            &[],
+            &[(postprocessing_job(), 1)],
+            &SabApiRequest::default(),
+            1,
+        );
+        assert_eq!(response["history"]["slots"][0]["pp"], "R");
+    }
+
     #[test]
     fn history_includes_postprocessing_before_terminal_slots() {
         let response = build_history_response(
@@ -3199,7 +3397,7 @@ mod tests {
                 JobStatus::Completed,
                 1,
             )],
-            &[postprocessing_job()],
+            &[(postprocessing_job(), 3)],
             &SabApiRequest::default(),
             4,
         );
@@ -3321,6 +3519,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3364,6 +3563,8 @@ mod tests {
             stages: Vec::new(),
             error_message: None,
             failure_code: None,
+            post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
@@ -3450,6 +3651,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3482,6 +3684,7 @@ mod tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         };
@@ -3652,7 +3855,7 @@ mod tests {
             queue_job("default-job", "Default Job", "Default", JobStatus::Queued),
             queue_job("tv-job", "TV Job", "tv", JobStatus::Queued),
         ];
-        let all = build_queue_response(&jobs, false, 0, 0, &SabApiRequest::default());
+        let all = build_queue_response(&jobs, false, 0, 0, &SabApiRequest::default(), |_| 3);
         assert_eq!(all["queue"]["slots"][0]["cat"], "*");
         assert_eq!(all["queue"]["slots"][1]["cat"], "tv");
 
@@ -3660,7 +3863,7 @@ mod tests {
             cat: Some("*".into()),
             ..SabApiRequest::default()
         };
-        let filtered = build_queue_response(&jobs, false, 0, 0, &star);
+        let filtered = build_queue_response(&jobs, false, 0, 0, &star, |_| 3);
         assert_eq!(filtered["queue"]["noofslots"], 1);
         assert_eq!(filtered["queue"]["slots"][0]["filename"], "Default Job");
 
@@ -4348,9 +4551,18 @@ mod tests {
         // SABnzbd's cumulative 2 (+repair/unpack) is RustNZB's 3.
         let repair_unpack = addfile_multipart(SabApiRequest::default(), &[("pp", "2")]).await;
         assert_eq!(repair_unpack.pp_override, Some(3));
+        // ... but without SABnzbd's "+Delete": the archives are kept.
+        assert_eq!(repair_unpack.delete_archives, Some(false));
+
+        let repair_unpack_delete =
+            addfile_multipart(SabApiRequest::default(), &[("pp", "3")]).await;
+        assert_eq!(repair_unpack_delete.pp_override, Some(3));
+        assert_eq!(repair_unpack_delete.delete_archives, Some(true));
+        assert_eq!(from_query.delete_archives, None);
 
         let invalid = addfile_multipart(SabApiRequest::default(), &[("pp", "7")]).await;
         assert_eq!(invalid.pp_override, None);
+        assert_eq!(invalid.delete_archives, None);
 
         let absent = addfile_multipart(SabApiRequest::default(), &[]).await;
         assert_eq!(absent.pp_override, None);
@@ -4456,6 +4668,8 @@ mod tests {
             stages: Vec::new(),
             error_message: None,
             failure_code: None,
+            post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
