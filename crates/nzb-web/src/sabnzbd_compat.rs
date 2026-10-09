@@ -677,6 +677,8 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
     let qm = &state.queue_manager;
     let speed_limit = qm.get_speed_limit();
     let pause_int = qm.pause_remaining_secs().unwrap_or(0).max(0).to_string();
+    let (free1, total1, free1_norm) = sab_disk_space(&qm.incomplete_dir());
+    let (free2, total2, free2_norm) = sab_disk_space(&qm.complete_dir());
 
     Json(serde_json::json!({
         "status": {
@@ -691,12 +693,12 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "configfn": state.config_path.to_string_lossy(),
             "confighelpuri": "https://sabnzbd.org/wiki/configuration/5.0/",
             "delayed_assembler": 0,
-            "diskspace1": "0.00",
-            "diskspace1_norm": "0 B",
-            "diskspace2": "0.00",
-            "diskspace2_norm": "0 B",
-            "diskspacetotal1": "0.00",
-            "diskspacetotal2": "0.00",
+            "diskspace1": free1,
+            "diskspace1_norm": free1_norm,
+            "diskspace2": free2,
+            "diskspace2_norm": free2_norm,
+            "diskspacetotal1": total1,
+            "diskspacetotal2": total2,
             "dnslookup": false,
             "downloaddir": general.incomplete_dir.to_string_lossy(),
             "downloaddirspeed": 0,
@@ -729,10 +731,10 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "pystone": 0,
             "quota": "0 B",
             "rtl": false,
-            "servers": Vec::<serde_json::Value>::new(),
+            "servers": sab_status_servers(state),
             "speedlimit": if speed_limit == 0 { "0" } else { "100" },
             "speedlimit_abs": speed_limit.to_string(),
-            "uptime": "0m",
+            "uptime": format_sab_age(state.started_at.elapsed().as_secs()),
             "url_base": "",
             "version": SABNZBD_COMPAT_VERSION,
             "warnings": Vec::<serde_json::Value>::new(),
@@ -780,13 +782,71 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     let speed_bps = qm.get_speed();
     let speed_limit_bps = qm.get_speed_limit();
 
-    Json(build_queue_response(
-        &jobs,
-        paused,
-        speed_bps,
-        speed_limit_bps,
-        req,
-    ))
+    let mut response = build_queue_response(&jobs, paused, speed_bps, speed_limit_bps, req);
+    let queue = &mut response["queue"];
+    let (free1, total1, free1_norm) = sab_disk_space(&qm.incomplete_dir());
+    let (free2, total2, free2_norm) = sab_disk_space(&qm.complete_dir());
+    queue["diskspace1"] = free1.into();
+    queue["diskspacetotal1"] = total1.into();
+    queue["diskspace1_norm"] = free1_norm.into();
+    queue["diskspace2"] = free2.into();
+    queue["diskspacetotal2"] = total2.into();
+    queue["diskspace2_norm"] = free2_norm.into();
+    Json(response)
+}
+
+/// SABnzbd's disk-space values for the filesystem holding `dir`: free and
+/// total space in GiB formatted `%.2f` (`diskspaceN` / `diskspacetotalN`),
+/// and the free space in human units (`diskspaceN_norm`).
+fn sab_disk_space(dir: &std::path::Path) -> (String, String, String) {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let (free, total) = crate::queue_manager::disk_space(dir);
+    (
+        format!("{:.2}", free as f64 / GIB),
+        format!("{:.2}", total as f64 / GIB),
+        format_size_human(free),
+    )
+}
+
+/// Format an elapsed time like SABnzbd's `calc_age` (used for `uptime`):
+/// whole days, else whole hours, else whole minutes.
+fn format_sab_age(seconds: u64) -> String {
+    if seconds >= 86_400 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds >= 3_600 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}m", seconds / 60)
+    }
+}
+
+/// fullstatus `servers` entries for the configured news servers, using
+/// SABnzbd's key names. Only values RustNZB tracks are populated; the rest
+/// use SABnzbd's idle defaults.
+fn sab_status_servers(state: &AppState) -> Vec<serde_json::Value> {
+    let connections = state.queue_manager.connection_snapshot();
+    state
+        .config()
+        .servers
+        .iter()
+        .map(|server| {
+            let active = connections
+                .iter()
+                .find(|(id, _, _)| *id == server.id)
+                .map_or(0, |(_, active, _)| *active);
+            serde_json::json!({
+                "servername": if server.name.is_empty() { &server.host } else { &server.name },
+                "serveractiveconn": active,
+                "servertotalconn": server.connections,
+                "serverconnections": Vec::<serde_json::Value>::new(),
+                "serverssl": server.ssl,
+                "serveractive": server.enabled,
+                "servererror": "",
+                "serverpriority": server.priority,
+                "serveroptional": server.optional,
+            })
+        })
+        .collect()
 }
 
 fn build_queue_response(
@@ -2873,6 +2933,68 @@ mod tests {
         .0;
         assert_eq!(malformed["status"], serde_json::json!(false));
         assert!(malformed["error"].is_string());
+    }
+
+    fn assert_real_gigabytes(value: &serde_json::Value, field: &str) {
+        let gigabytes: f64 = value[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("{field} is a string"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{field} is numeric"));
+        assert!(gigabytes > 0.0, "{field} should report real disk space");
+    }
+
+    /// queue and fullstatus must report real free/total space for the
+    /// incomplete (1) and complete (2) directories, not hardcoded zeros.
+    #[tokio::test]
+    async fn queue_and_fullstatus_report_real_disk_space() {
+        let test_state = test_state();
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        for section in [&queue["queue"], &fullstatus["status"]] {
+            for field in [
+                "diskspace1",
+                "diskspace2",
+                "diskspacetotal1",
+                "diskspacetotal2",
+            ] {
+                assert_real_gigabytes(section, field);
+            }
+            assert_ne!(section["diskspace1_norm"], "0 B");
+            assert_ne!(section["diskspace2_norm"], "0 B");
+        }
+    }
+
+    /// fullstatus reports uptime since start in SABnzbd's `calc_age` form
+    /// and lists the configured servers.
+    #[tokio::test]
+    async fn fullstatus_reports_uptime_and_configured_servers() {
+        let mut test_state = test_state();
+        test_state.state.started_at -= std::time::Duration::from_secs(2 * 3600 + 120);
+        let mut config = (*test_state.state.config()).clone();
+        let mut server = crate::nzb_core::config::ServerConfig::new("srv-1", "news.example.com");
+        server.name = "Primary".into();
+        server.connections = 12;
+        config.servers = vec![server];
+        test_state.state.config.store(Arc::new(config));
+
+        let status = dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        let status = &status["status"];
+        assert_eq!(status["uptime"], "2h");
+        let servers = status["servers"].as_array().expect("servers array");
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["servername"], "Primary");
+        assert_eq!(servers[0]["servertotalconn"], 12);
+        assert_eq!(servers[0]["serveractive"], true);
+    }
+
+    #[test]
+    fn sab_age_matches_sabnzbd_calc_age() {
+        assert_eq!(format_sab_age(0), "0m");
+        assert_eq!(format_sab_age(3599), "59m");
+        assert_eq!(format_sab_age(3600), "1h");
+        assert_eq!(format_sab_age(2 * 86_400 + 5), "2d");
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
