@@ -56,7 +56,8 @@ impl Database {
 
         if version < 1 {
             info!("Applying database migration v1");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- Active download queue
                 CREATE TABLE IF NOT EXISTS queue (
@@ -109,45 +110,36 @@ impl Database {
                     config TEXT NOT NULL -- JSON ServerConfig
                 );
 
-                INSERT INTO schema_version (version) VALUES (1);
                 ",
             )?;
+            commit_migration(tx, 1)?;
         }
 
         if version < 2 {
             info!("Applying database migration v2");
-            self.conn.execute_batch(
-                "
-                -- Add NZB data storage and server stats to history
-                ALTER TABLE history ADD COLUMN nzb_data BLOB;
-                ALTER TABLE history ADD COLUMN server_stats TEXT DEFAULT '[]';
-
-                -- Add server stats to queue
-                ALTER TABLE queue ADD COLUMN server_stats TEXT DEFAULT '[]';
-
-                -- Add NZB data to queue for preservation
-                ALTER TABLE queue ADD COLUMN nzb_raw BLOB;
-
-                UPDATE schema_version SET version = 2;
-                ",
-            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            // NZB data storage and server stats on history
+            add_column_if_missing(&tx, "history", "nzb_data", "BLOB")?;
+            add_column_if_missing(&tx, "history", "server_stats", "TEXT DEFAULT '[]'")?;
+            // Server stats on queue
+            add_column_if_missing(&tx, "queue", "server_stats", "TEXT DEFAULT '[]'")?;
+            // NZB data on queue for preservation
+            add_column_if_missing(&tx, "queue", "nzb_raw", "BLOB")?;
+            commit_migration(tx, 2)?;
         }
 
         if version < 3 {
             info!("Applying database migration v3");
-            self.conn.execute_batch(
-                "
-                -- Per-job log storage for history
-                ALTER TABLE history ADD COLUMN job_logs TEXT DEFAULT '[]';
-
-                UPDATE schema_version SET version = 3;
-                ",
-            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            // Per-job log storage for history
+            add_column_if_missing(&tx, "history", "job_logs", "TEXT DEFAULT '[]'")?;
+            commit_migration(tx, 3)?;
         }
 
         if version < 4 {
             info!("Applying database migration v4");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 -- RSS feed items (persistent feed cache)
                 CREATE TABLE IF NOT EXISTS rss_items (
@@ -177,23 +169,24 @@ impl Database {
                     enabled INTEGER NOT NULL DEFAULT 1
                 );
 
-                UPDATE schema_version SET version = 4;
                 ",
             )?;
+            commit_migration(tx, 4)?;
         }
 
         if version < 5 {
             info!("Applying database migration v5: settings table");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
 
-                UPDATE schema_version SET version = 5;
                 ",
             )?;
+            commit_migration(tx, 5)?;
         }
 
         // Ensure settings table exists for databases that jumped to v5
@@ -208,7 +201,8 @@ impl Database {
         #[cfg(feature = "groups-db")]
         if version < 6 {
             info!("Applying database migration v6: newsgroup browsing");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS groups (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,14 +248,15 @@ impl Database {
                     INSERT INTO headers_fts(headers_fts, rowid, subject, author) VALUES ('delete', old.id, old.subject, old.author);
                 END;
 
-                UPDATE schema_version SET version = 6;
                 ",
             )?;
+            commit_migration(tx, 6)?;
         }
 
         if version < 7 {
             info!("Applying database migration v7: persistent download statistics");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS download_statistics (
                     job_id TEXT PRIMARY KEY,
@@ -292,41 +287,33 @@ impl Database {
                     COALESCE(server_stats, '[]')
                 FROM history;
 
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (7);
                 ",
             )?;
+            commit_migration(tx, 7)?;
         }
 
         if version < 8 {
             info!("Applying database migration v8: active download duration");
-            self.conn.execute_batch(
-                "
-                ALTER TABLE history ADD COLUMN download_time_secs REAL;
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (8);
-                ",
-            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            add_column_if_missing(&tx, "history", "download_time_secs", "REAL")?;
+            commit_migration(tx, 8)?;
         }
 
         if version < 9 {
             info!("Applying database migration v9: per-article retry outcomes");
-            self.conn.execute_batch(
-                "
-                ALTER TABLE history ADD COLUMN retry_data BLOB;
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (9);
-                ",
-            )?;
+            let tx = self.conn.unchecked_transaction()?;
+            add_column_if_missing(&tx, "history", "retry_data", "BLOB")?;
+            commit_migration(tx, 9)?;
         }
 
         if version < 10 {
             info!("Applying database migration v10: per-article damage ledger");
+            let tx = self.conn.unchecked_transaction()?;
             // Created empty. `history.retry_data` (v9) is a retry checkpoint,
             // not damage evidence, so there is no backfill: it carries no
             // failure reason, per-server evidence, TTL, or server fingerprint
             // to reconstruct a confirmed-missing record from. See WI-143.
-            self.conn.execute_batch(
+            tx.execute_batch(
                 "
                 CREATE TABLE IF NOT EXISTS damage_ledger (
                     scope_id TEXT NOT NULL,
@@ -343,66 +330,60 @@ impl Database {
                 );
                 CREATE INDEX IF NOT EXISTS idx_damage_ledger_file
                     ON damage_ledger (scope_id, file_index);
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (10);
                 ",
             )?;
+            commit_migration(tx, 10)?;
         }
 
         if version < 11 {
             info!("Applying database migration v11: idempotent queue admissions");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            tx.execute_batch(
                 "
-                CREATE TABLE queue_admissions (
+                CREATE TABLE IF NOT EXISTS queue_admissions (
                     idempotency_key TEXT PRIMARY KEY,
                     payload_digest TEXT NOT NULL,
                     job_id TEXT NOT NULL UNIQUE,
                     accepted_at TEXT NOT NULL
                 );
 
-                CREATE INDEX idx_queue_admissions_job
+                CREATE INDEX IF NOT EXISTS idx_queue_admissions_job
                     ON queue_admissions(job_id);
 
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (11);
                 ",
             )?;
+            commit_migration(tx, 11)?;
         }
 
         if version < 12 {
             info!("Applying database migration v12: typed terminal failure codes");
-            self.conn.execute_batch(
+            let tx = self.conn.unchecked_transaction()?;
+            add_column_if_missing(&tx, "history", "failure_code", "TEXT")?;
+            tx.execute_batch(
                 "
-                ALTER TABLE history ADD COLUMN failure_code TEXT;
                 UPDATE history
                 SET failure_code = 'download_failed'
                 WHERE LOWER(status) = 'failed' AND failure_code IS NULL;
 
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (12);
                 ",
             )?;
+            commit_migration(tx, 12)?;
         }
 
         if version < 13 {
             info!("Applying database migration v13: per-job post-processing override");
+            let tx = self.conn.unchecked_transaction()?;
             // Partial schemas (as built by migration tests) may lack the
             // queue table; only add the column where the table exists.
-            let has_queue: i64 = self.conn.query_row(
+            let has_queue: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'queue'",
                 [],
                 |row| row.get(0),
             )?;
             if has_queue > 0 {
-                self.conn
-                    .execute_batch("ALTER TABLE queue ADD COLUMN pp_override INTEGER;")?;
+                add_column_if_missing(&tx, "queue", "pp_override", "INTEGER")?;
             }
-            self.conn.execute_batch(
-                "
-                DELETE FROM schema_version;
-                INSERT INTO schema_version (version) VALUES (13);
-                ",
-            )?;
+            commit_migration(tx, 13)?;
         }
 
         Ok(())
@@ -1292,6 +1273,47 @@ impl Database {
 // Parse helpers
 // ---------------------------------------------------------------------------
 
+/// Commit one migration step together with its `schema_version` bump.
+///
+/// Each step runs inside the transaction `tx` (SQLite DDL is transactional),
+/// so a step that fails or a process that dies part-way leaves neither its
+/// schema changes nor the version bump behind, and the next start re-runs the
+/// whole step. The version row is rewritten in the same transaction, so no
+/// reader ever observes an empty `schema_version` table.
+fn commit_migration(tx: rusqlite::Transaction<'_>, version: u32) -> Result<(), NzbError> {
+    tx.execute("DELETE FROM schema_version", [])?;
+    tx.execute(
+        "INSERT INTO schema_version (version) VALUES (?1)",
+        [version],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// `ALTER TABLE ... ADD COLUMN` that is a no-op when the column already
+/// exists. Databases migrated before steps were transactional can hold a
+/// step's committed column without its version bump; this lets that step
+/// re-run instead of failing with "duplicate column name" on every start.
+/// `table`, `column` and `definition` are compile-time constants.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), NzbError> {
+    let present: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
+    }
+    Ok(())
+}
+
 fn parse_status(s: &str) -> JobStatus {
     match s.to_lowercase().as_str() {
         "queued" => JobStatus::Queued,
@@ -1571,6 +1593,111 @@ mod tests {
             .unwrap();
         assert_eq!(failed.as_deref(), Some("download_failed"));
         assert_eq!(completed, None);
+    }
+
+    fn schema_version_of(path: &Path) -> u32 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        count > 0
+    }
+
+    /// A migration step whose `ALTER TABLE ... ADD COLUMN` committed but
+    /// whose `schema_version` bump did not (crash, disk full) must not make
+    /// the database permanently unopenable: re-running the step has to
+    /// tolerate the already-present column.
+    #[test]
+    fn migration_recovers_when_columns_exist_but_version_was_not_bumped() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let current = {
+            let db = Database::open(&path).unwrap();
+            db.history_insert(&make_history("kept", "Kept")).unwrap();
+            drop(db);
+            schema_version_of(&path)
+        };
+        assert!(current >= 13);
+
+        // Roll the recorded version back so v12/v13 re-run against a schema
+        // that already carries their columns.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (11);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path).expect("re-running applied migrations must succeed");
+        assert!(db.history_get("kept").unwrap().is_some());
+        drop(db);
+        assert_eq!(schema_version_of(&path), current);
+
+        // Same for every older ADD COLUMN step.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (1);",
+            )
+            .unwrap();
+        drop(connection);
+        Database::open(&path).expect("re-running v2..v13 must succeed");
+        assert_eq!(schema_version_of(&path), current);
+    }
+
+    /// A migration step that fails part-way must roll back completely, so the
+    /// next start sees the pre-step schema and the old version, not a
+    /// half-applied step.
+    #[test]
+    fn failed_migration_step_rolls_back_schema_and_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let connection = Connection::open(&path).unwrap();
+        // v12 adds history.failure_code and then backfills it from
+        // history.status. With no status column, the ALTER succeeds and the
+        // backfill fails, i.e. the step breaks half-way.
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE schema_version (version INTEGER NOT NULL);
+                INSERT INTO schema_version (version) VALUES (11);
+                CREATE TABLE history (id TEXT PRIMARY KEY);
+                ",
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(Database::open(&path).is_err());
+
+        let connection = Connection::open(&path).unwrap();
+        assert!(
+            !column_exists(&connection, "history", "failure_code"),
+            "half-applied v12 must be rolled back"
+        );
+        assert_eq!(schema_version_of(&path), 11);
+
+        // Once the cause is fixed, the step applies cleanly.
+        connection
+            .execute_batch("ALTER TABLE history ADD COLUMN status TEXT NOT NULL DEFAULT 'Failed';")
+            .unwrap();
+        drop(connection);
+        Database::open(&path).unwrap();
+        assert!(schema_version_of(&path) >= 12);
     }
 
     #[test]
