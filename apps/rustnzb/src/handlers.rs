@@ -276,7 +276,12 @@ pub async fn h_queue_list(
     // Apply pagination (default: first 100 jobs)
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(100);
-    let jobs: Vec<_> = all_jobs.into_iter().skip(offset).take(limit).collect();
+    let jobs: Vec<_> = all_jobs
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(mask_job_password)
+        .collect();
 
     Ok(Json(QueueResponse {
         jobs,
@@ -284,6 +289,20 @@ pub async fn h_queue_list(
         speed_bps,
         paused,
     }))
+}
+
+/// Replace a job's archive password with [`PASSWORD_MASK`] (or `""` when it
+/// has none) for the native API, as server passwords are masked in config
+/// responses. The SABnzbd layer keeps the real value: its queue slot
+/// contract includes `password`. No native endpoint accepts a job password
+/// back, so the mask can never be stored in place of the real one.
+fn mask_job_password(mut job: NzbJob) -> NzbJob {
+    job.password = Some(if job.password.is_some_and(|pw| !pw.is_empty()) {
+        PASSWORD_MASK.to_string()
+    } else {
+        String::new()
+    });
+    job
 }
 
 /// Enqueue a single NZB from raw bytes, applying category/priority from query params.
