@@ -176,7 +176,7 @@ async fn handle_addurl(
             if let Some(ref c) = cat
                 && !c.is_empty()
             {
-                job.category = sab_resolve_category(c).to_string();
+                job.category = sab_add_category(state, c);
             }
             if let Some(ref p) = priority {
                 job.priority = sab_priority_to_priority(p);
@@ -480,7 +480,7 @@ async fn dispatch_post(
                     if let Some(ref c) = cat
                         && !c.is_empty()
                     {
-                        job.category = sab_resolve_category(c).to_string();
+                        job.category = sab_add_category(state, c);
                     }
                     if let Some(ref p) = priority {
                         job.priority = sab_priority_to_priority(p);
@@ -1565,6 +1565,27 @@ fn handle_get_cats(state: &AppState) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "categories": cats }))
 }
 
+/// Resolve the `cat` of an `addfile`/`addurl` request to a configured
+/// category. SABnzbd matches category names case-insensitively and falls
+/// back to the default category for an unknown one, instead of storing the
+/// client's string verbatim.
+fn sab_add_category(state: &AppState, cat: &str) -> String {
+    let config = state.config();
+    let requested = sab_resolve_category(cat);
+    config
+        .categories
+        .iter()
+        .find(|category| category.name.eq_ignore_ascii_case(requested))
+        .or_else(|| {
+            config
+                .categories
+                .iter()
+                .find(|category| category.name.eq_ignore_ascii_case("Default"))
+        })
+        .or_else(|| config.categories.first())
+        .map_or_else(|| "Default".to_string(), |category| category.name.clone())
+}
+
 /// Translate a client-supplied category into RustNZB's internal name,
 /// resolving SABnzbd's `"*"` default-category sentinel.
 fn sab_resolve_category(cat: &str) -> &str {
@@ -1976,7 +1997,7 @@ mod tests {
 
     use crate::auth::{CredentialStore, TokenStore};
     use crate::log_buffer::LogBuffer;
-    use crate::nzb_core::config::AppConfig;
+    use crate::nzb_core::config::{AppConfig, CategoryConfig};
     use crate::nzb_core::db::Database;
     use crate::queue_manager::QueueManager;
 
@@ -2873,6 +2894,59 @@ mod tests {
         .0;
         assert_eq!(malformed["status"], serde_json::json!(false));
         assert!(malformed["error"].is_string());
+    }
+
+    async fn addfile_with_category(test_state: &TestState, cat: &str) -> String {
+        let response = dispatch_post(
+            &test_state.state,
+            "addfile".into(),
+            None,
+            Some(cat.into()),
+            None,
+            Some((format!("{cat}.nzb"), SAMPLE_NZB.as_bytes().to_vec())),
+            None,
+            None,
+            SabApiRequest::default(),
+        )
+        .await
+        .expect("addfile response")
+        .0;
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
+        let nzo_id = response["nzo_ids"][0].as_str().expect("nzo_id").to_string();
+        let raw = nzo_id.strip_prefix("SABnzbd_nzo_").expect("nzo prefix");
+        test_state
+            .state
+            .queue_manager
+            .get_jobs()
+            .into_iter()
+            .find(|job| job.id.starts_with(raw))
+            .expect("added job")
+            .category
+    }
+
+    /// SABnzbd falls back to the default category when `addfile`/`addurl`
+    /// name a category that is not configured, and matches configured
+    /// category names case-insensitively.
+    #[tokio::test]
+    async fn add_with_unknown_category_falls_back_to_default() {
+        let test_state = test_state();
+        let mut config = (*test_state.state.config()).clone();
+        config.categories.push(CategoryConfig {
+            name: "tv".into(),
+            ..CategoryConfig::default()
+        });
+        test_state.state.config.store(Arc::new(config));
+
+        assert_eq!(
+            addfile_with_category(&test_state, "no-such-cat").await,
+            "Default"
+        );
+        assert_eq!(addfile_with_category(&test_state, "TV").await, "tv");
+        assert_eq!(addfile_with_category(&test_state, "*").await, "Default");
     }
 
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
