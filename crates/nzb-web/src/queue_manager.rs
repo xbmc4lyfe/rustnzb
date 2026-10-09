@@ -4636,12 +4636,14 @@ impl QueueManager {
         //    progress-handler task handles so they can be aborted after the
         //    pool drains.
         let mut handles = Vec::new();
+        let mut interrupted = HashSet::new();
         {
             let mut jobs = self.jobs.lock();
             for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Downloading {
                     info!(job_id = %id, "Marking download for shutdown");
                     state.job.status = JobStatus::Queued; // Will resume on restart
+                    interrupted.insert(id.clone());
                 }
                 if let Some(handle) = state.progress_handle.take() {
                     handles.push(handle);
@@ -4660,7 +4662,10 @@ impl QueueManager {
             handle.abort();
         }
 
-        // 4. Persist final state for all jobs to DB
+        // 4. Persist final state for all jobs to DB. Interrupted downloads
+        //    also get a fresh article checkpoint: the periodic one can be
+        //    seconds old, and without it a restart re-fetches every article
+        //    that completed since.
         {
             let jobs = self.jobs.lock();
             let db = self.db.lock();
@@ -4674,6 +4679,14 @@ impl QueueManager {
                     state.job.files_completed,
                 ) {
                     error!(job_id = %id, error = %e, "Failed to persist job state on shutdown");
+                }
+                if interrupted.contains(id) {
+                    let checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+                    if let Ok(data) = serde_json::to_vec(&checkpoint)
+                        && let Err(e) = db.queue_store_job_data(id, &data)
+                    {
+                        error!(job_id = %id, error = %e, "Failed to persist checkpoint on shutdown");
+                    }
                 }
             }
         }
@@ -5055,6 +5068,46 @@ mod global_pause_tests {
         assert_eq!(manager.get_speed_limit(), 1_000);
         manager.set_speed_limit(0);
         assert_eq!(manager.get_speed_limit(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_article_checkpoint_for_active_downloads() {
+        let (manager, _tempdir) = manager();
+        let nzb = br#"<?xml version="1.0" encoding="utf-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="0" subject="&quot;flush.bin&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="5" number="1">flush-1@test</segment>
+      <segment bytes="6" number="2">flush-2@test</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let mut job = nzb_parser::parse_nzb("flush", nzb).unwrap();
+        job.id = "flush".into();
+        job.status = JobStatus::Downloading;
+        let filename = job.files[0].filename.clone();
+        manager.db.lock().queue_insert(&job).unwrap();
+
+        // Article 1 arrived after the last periodic checkpoint: it is only
+        // recorded in memory when shutdown begins.
+        job.files[0].articles[0].downloaded = true;
+        job.downloaded_bytes = 5;
+        job.articles_downloaded = 1;
+        insert_job(&manager, job);
+
+        manager.shutdown().await;
+
+        let data = manager
+            .db
+            .lock()
+            .queue_load_job_data("flush")
+            .unwrap()
+            .expect("shutdown should persist an article checkpoint");
+        let checkpoint: JobCheckpoint = serde_json::from_slice(&data).unwrap();
+        assert_eq!(checkpoint.files.get(&filename), Some(&vec![1]));
+        assert_eq!(checkpoint.articles_downloaded, 1);
+        assert_eq!(checkpoint.downloaded_bytes, 5);
     }
 
     #[tokio::test]
