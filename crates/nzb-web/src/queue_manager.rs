@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::{CategoryConfig, ServerConfig, normalize_history_retention};
@@ -90,6 +90,11 @@ fn cleanup_terminal_work_dir(
 /// Upper bound on `<name>.<n>` suffixes tried when the complete directory
 /// already holds folders with a job's name.
 const MAX_OUTPUT_DIR_SUFFIX: u32 = 9999;
+
+/// How long graceful shutdown waits for the per-job progress listeners to
+/// drain events the worker pool queued before it stopped. Listeners still
+/// running at the deadline are aborted so shutdown stays bounded.
+const PROGRESS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Atomically reserve a complete-directory folder derived from `base`.
 ///
@@ -1107,6 +1112,9 @@ pub struct QueueManager {
     servers: Arc<Mutex<Vec<ServerConfig>>>,
     /// Whether all downloads are globally paused.
     globally_paused: AtomicBool,
+    /// Flipped to `true` by graceful shutdown: tells every per-job progress
+    /// listener to stop accepting events, drain the queued ones and exit.
+    progress_shutdown: watch::Sender<bool>,
     /// Serializes global pause/resume transitions with individual resume
     /// attempts so the global gate cannot be bypassed by a racing request.
     pause_transition: Mutex<()>,
@@ -1248,6 +1256,7 @@ impl QueueManager {
             job_order: Mutex::new(Vec::new()),
             servers: servers_arc,
             globally_paused: AtomicBool::new(false),
+            progress_shutdown: watch::channel(false).0,
             pause_transition: Mutex::new(()),
             globally_paused_jobs: Mutex::new(HashSet::new()),
             speed: SpeedTracker::new(),
@@ -1980,8 +1989,28 @@ impl QueueManager {
         job_speed: Arc<SpeedTracker>,
     ) {
         let mut last_db_update = Instant::now();
+        let mut shutdown = self.progress_shutdown.subscribe();
+        let mut draining = false;
 
-        while let Some(update) = progress_rx.recv().await {
+        loop {
+            let update = tokio::select! {
+                biased;
+                update = progress_rx.recv() => match update {
+                    Some(update) => update,
+                    None => break,
+                },
+                _ = shutdown.wait_for(|stop| *stop), if !draining => {
+                    // Graceful shutdown: the pool has stopped, but the job
+                    // context still holds the sender, so the channel never
+                    // closes on its own. Close it from this side; `recv`
+                    // keeps yielding the events already queued and then
+                    // returns `None`, so every finished article is recorded
+                    // before shutdown writes the checkpoint.
+                    progress_rx.close();
+                    draining = true;
+                    continue;
+                }
+            };
             match update {
                 ProgressUpdate::WaitingForProviders { message, .. } => {
                     let mut changed = false;
@@ -4633,8 +4662,8 @@ impl QueueManager {
         self.globally_paused.store(true, Ordering::Relaxed);
 
         // 2. Mark downloading jobs as Queued for next restart, and collect
-        //    progress-handler task handles so they can be aborted after the
-        //    pool drains.
+        //    progress-handler task handles so they can drain after the pool
+        //    stops.
         let mut handles = Vec::new();
         let mut interrupted = HashSet::new();
         {
@@ -4655,14 +4684,23 @@ impl QueueManager {
         //    first (finish-in-flight), then workers exit.
         self.dispatch.shutdown().await;
 
-        // 4. Abort the per-job progress listeners (their sender sides are
-        //    dropped, so the loops would exit anyway; we just don't want to
-        //    wait for them).
-        for handle in handles {
-            handle.abort();
+        // 4. Let the per-job progress listeners record the events the pool
+        //    queued before it stopped. Their senders live on in the pool's
+        //    job contexts, so signal them to drain and exit; abort any that
+        //    miss the deadline.
+        self.progress_shutdown.send_replace(true);
+        let deadline = tokio::time::Instant::now() + PROGRESS_DRAIN_TIMEOUT;
+        for mut handle in handles {
+            if tokio::time::timeout_at(deadline, &mut handle)
+                .await
+                .is_err()
+            {
+                warn!("Progress listener did not drain before the shutdown deadline; aborting it");
+                handle.abort();
+            }
         }
 
-        // 4. Persist final state for all jobs to DB. Interrupted downloads
+        // 5. Persist final state for all jobs to DB. Interrupted downloads
         //    also get a fresh article checkpoint: the periodic one can be
         //    seconds old, and without it a restart re-fetches every article
         //    that completed since.
@@ -5108,6 +5146,78 @@ mod global_pause_tests {
         assert_eq!(checkpoint.files.get(&filename), Some(&vec![1]));
         assert_eq!(checkpoint.articles_downloaded, 1);
         assert_eq!(checkpoint.downloaded_bytes, 5);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_pending_progress_before_flushing_checkpoint() {
+        let (manager, _tempdir) = manager();
+        let nzb = br#"<?xml version="1.0" encoding="utf-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="p" date="0" subject="&quot;drain.bin&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="5" number="1">drain-1@test</segment>
+      <segment bytes="6" number="2">drain-2@test</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let mut job = nzb_parser::parse_nzb("drain", nzb).unwrap();
+        job.id = "drain".into();
+        job.status = JobStatus::Downloading;
+        let filename = job.files[0].filename.clone();
+        let file_id = job.files[0].id.clone();
+        manager.db.lock().queue_insert(&job).unwrap();
+        insert_job(&manager, job);
+
+        // Wire up the per-job listener exactly as start_job does. The sender
+        // stays alive for the whole test, as it does inside the worker pool's
+        // job context, so the listener never sees its channel close.
+        let (progress_tx, progress_rx) = mpsc::channel(16);
+        let qm = Arc::clone(&manager);
+        let handle = tokio::spawn(async move {
+            qm.handle_progress("drain".into(), progress_rx, Arc::new(SpeedTracker::new()))
+                .await;
+        });
+        manager
+            .jobs
+            .lock()
+            .get_mut("drain")
+            .unwrap()
+            .progress_handle = Some(handle);
+
+        // Article 1 finished in the last instant before shutdown: its event
+        // is queued, but the listener has not processed it yet.
+        progress_tx
+            .try_send(ProgressUpdate::ArticleComplete {
+                job_id: "drain".into(),
+                file_id,
+                segment_number: 1,
+                decoded_bytes: 5,
+                file_complete: false,
+                server_id: None,
+                yenc_filename: None,
+            })
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(30), manager.shutdown())
+            .await
+            .expect("shutdown must not wait on a listener whose sender is still alive");
+
+        let data = manager
+            .db
+            .lock()
+            .queue_load_job_data("drain")
+            .unwrap()
+            .expect("shutdown should persist an article checkpoint");
+        let checkpoint: JobCheckpoint = serde_json::from_slice(&data).unwrap();
+        assert_eq!(
+            checkpoint.files.get(&filename),
+            Some(&vec![1]),
+            "the queued ArticleComplete must be drained into the checkpoint"
+        );
+        assert_eq!(checkpoint.articles_downloaded, 1);
+        assert_eq!(checkpoint.downloaded_bytes, 5);
+        drop(progress_tx);
     }
 
     #[tokio::test]
