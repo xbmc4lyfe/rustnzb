@@ -8,7 +8,7 @@ import { Observable, Subscription, finalize } from 'rxjs';
 import { ApiService } from '../../core/services/api.service';
 import { AddNzbService } from '../../core/services/add-nzb.service';
 import { PauseStateService } from '../../core/services/pause-state.service';
-import { NzbJob, QueueResponse, StatusResponse } from '../../core/models/queue.model';
+import { NzbJob, PauseReason, QueueResponse, StatusResponse } from '../../core/models/queue.model';
 import { HistoryViewComponent } from '../history/history-view.component';
 import { ConfirmService } from '../../shared/confirm.service';
 import { IconComponent } from '../../shared/icon.component';
@@ -66,7 +66,7 @@ interface PipelineStep {
         <div class="val">
           {{ speedValue() }} <span class="unit">{{ speedUnit() }}</span>
         </div>
-        <div class="sub">{{ paused() ? 'Paused' : 'Active · limit off' }}</div>
+        <div class="sub">{{ paused() ? pausedLabel() : 'Active · limit off' }}</div>
       </div>
       <div class="card">
         <div class="label">NNTP connections</div>
@@ -429,9 +429,16 @@ interface PipelineStep {
                 <td>{{ job.speed_bps > 0 ? formatSpeed(job.speed_bps) : '—' }}</td>
                 <td>{{ job.speed_bps > 0 ? eta(job) : '—' }}</td>
                 <td>
-                  <span class="status-pill" [class]="statusClass(effectiveStatus(job.status))">{{
-                    displayStatus(effectiveStatus(job.status))
-                  }}</span>
+                  <span
+                    class="status-pill"
+                    [class]="statusClass(effectiveStatus(job.status))"
+                    [attr.title]="
+                      isDiskSpaceHold(job)
+                        ? 'Waiting for free disk space; resumes automatically'
+                        : null
+                    "
+                    >{{ statusLabel(job) }}</span
+                  >
                 </td>
                 <td>
                   <select
@@ -1102,6 +1109,8 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   status = signal<StatusResponse | null>(null);
   selectedIds = signal<Set<string>>(new Set());
   paused: WritableSignal<boolean>;
+  /** Why the queue is globally paused, from the last queue refresh. */
+  pauseReason = signal<PauseReason | null>(null);
   actionPendingIds = signal<Set<string>>(new Set());
   draggingJobId = signal<string | null>(null);
   dragOverJobId = signal<string | null>(null);
@@ -1196,6 +1205,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       next: (r) => {
         this.jobs.set(r.jobs);
         this.paused.set(r.paused);
+        this.pauseReason.set(r.pause_reason ?? null);
         this.remainingBytes.set(
           r.jobs.reduce((sum, j) => sum + (j.total_bytes - j.downloaded_bytes), 0),
         );
@@ -1753,6 +1763,23 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     if (status === 'failed') return 's-fail';
     if (this.isPostProc(status)) return 's-pp';
     return 's-q';
+  }
+
+  /** Stat-card label while globally paused. */
+  pausedLabel(): string {
+    return this.pauseReason() === 'disk_space' ? 'Paused · low disk space' : 'Paused';
+  }
+
+  /** Whether this job is paused by the disk-space guard. */
+  isDiskSpaceHold(job: NzbJob): boolean {
+    if (this.effectiveStatus(job.status) !== 'paused') return false;
+    const reason = job.pause_reason ?? (this.paused() ? this.pauseReason() : null);
+    return reason === 'disk_space';
+  }
+
+  statusLabel(job: NzbJob): string {
+    if (this.isDiskSpaceHold(job)) return 'paused · low disk';
+    return this.displayStatus(this.effectiveStatus(job.status));
   }
 
   effectiveStatus(status: string): string {
