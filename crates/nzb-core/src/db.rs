@@ -737,7 +737,11 @@ impl Database {
         }
         let stages_json = serde_json::to_string(&entry.stages).unwrap_or_default();
         let server_stats_json = serde_json::to_string(&entry.server_stats).unwrap_or_default();
-        self.conn.execute(
+        // The history row and its statistics-ledger row commit together, so a
+        // failed ledger write cannot leave a history entry the statistics
+        // never counted.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO history (id, name, category, status, total_bytes, downloaded_bytes,
              added_at, completed_at, download_time_secs, output_dir, stages, error_message,
              nzb_data, server_stats, retry_data, failure_code)
@@ -773,7 +777,7 @@ impl Database {
         } else {
             0
         };
-        self.conn.execute(
+        tx.execute(
             "INSERT OR REPLACE INTO download_statistics (
                 job_id, completed_at, status, total_bytes, downloaded_bytes,
                 duration_secs, average_speed_bps, server_stats
@@ -789,6 +793,7 @@ impl Database {
                 server_stats_json,
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1866,6 +1871,35 @@ mod tests {
         assert_eq!(loaded[0].server_stats.len(), 1);
         assert_eq!(loaded[0].server_stats[0].server_id, "srv-1");
         assert_eq!(loaded[0].server_stats[0].articles_downloaded, 100);
+    }
+
+    /// The history row and its statistics-ledger row are one logical write:
+    /// if the ledger insert fails, the history row must not be left behind.
+    #[test]
+    fn history_insert_is_atomic_with_statistics_ledger() {
+        let db = Database::open_memory().unwrap();
+        db.conn
+            .execute_batch("DROP TABLE download_statistics;")
+            .unwrap();
+
+        assert!(db.history_insert(&make_history("h-1", "Half")).is_err());
+        assert!(
+            db.history_get("h-1").unwrap().is_none(),
+            "history row must roll back with the failed statistics write"
+        );
+    }
+
+    /// A lock held briefly by another connection (backup tool, second
+    /// process) must be waited on, not turned into an immediate SQLITE_BUSY.
+    #[test]
+    fn open_sets_busy_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open(&directory.path().join("queue.db")).unwrap();
+        let timeout_ms: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert!(timeout_ms >= 5_000, "busy_timeout was {timeout_ms} ms");
     }
 
     #[test]
