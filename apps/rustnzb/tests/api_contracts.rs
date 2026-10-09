@@ -336,3 +336,76 @@ async fn config_routes_validate_duplicates_and_persist_successful_updates() {
     assert_eq!(saved.general.speed_limit_bps, 1234);
     assert_eq!(app.state.config().general.speed_limit_bps, 1234);
 }
+
+#[tokio::test]
+async fn server_add_and_update_accept_partial_bodies() {
+    let app = start_app(true).await;
+    let client = reqwest::Client::new();
+    let tokens = client
+        .post(format!("{}/api/auth/login", app.base_url))
+        .json(&serde_json::json!({"username":"admin","password":"password"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+
+    // No id, no ssl_verify/retention/enabled/optional/priority.
+    let added = client
+        .post(format!("{}/api/config/servers", app.base_url))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({
+            "name": "Primary", "host": "news.example.test", "username": "user",
+            "password": "secret", "retention": 3000
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = added.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{}",
+        added.text().await.unwrap()
+    );
+    let server = app.state.config().servers[0].clone();
+    assert!(!server.id.is_empty(), "server id must be generated");
+    assert!(server.ssl_verify);
+    assert!(server.enabled);
+    assert!(!server.optional);
+    assert_eq!(server.port, 563);
+
+    // Partial update: only the changed field is sent; the rest is kept.
+    let updated = client
+        .put(format!("{}/api/config/servers/{}", app.base_url, server.id))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({ "connections": 4 }))
+        .send()
+        .await
+        .unwrap();
+    let status = updated.status();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "{}",
+        updated.text().await.unwrap()
+    );
+    let saved = AppConfig::load(&app.config_path).unwrap().servers[0].clone();
+    assert_eq!(saved.id, server.id);
+    assert_eq!(saved.connections, 4);
+    assert_eq!(saved.host, "news.example.test");
+    assert_eq!(saved.retention, 3000);
+    assert_eq!(saved.password.as_deref(), Some("secret"));
+
+    // A type error is a client error, not a 500.
+    let bad = client
+        .put(format!("{}/api/config/servers/{}", app.base_url, server.id))
+        .bearer_auth(&access)
+        .json(&serde_json::json!({ "port": "not-a-port" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+}
