@@ -391,7 +391,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                 );
                 let dav_router = nzbdav_dav::dav_router(Arc::clone(&dav.store)).layer(dav_auth);
-                r = r.nest("/dav", dav_router);
+                r = r.nest("/dav", rustnzb::server::with_security_headers(dav_router));
                 let cfg = result.state.config();
                 if cfg.dav.username.is_none()
                     && cfg.dav.password.is_none()

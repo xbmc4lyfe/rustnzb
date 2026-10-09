@@ -143,6 +143,12 @@ pub struct GeneralConfig {
     /// against the URL host (`prowlarr`, `nzbhydra.lan`). Default: empty.
     #[serde(default)]
     pub fetch_allowed_hosts: Vec<String>,
+    /// Browser origins (`scheme://host[:port]`) allowed to call the HTTP API
+    /// cross-origin, for a dashboard or proxy served from another origin.
+    /// Empty (the default) means same-origin only. Server-to-server clients
+    /// such as Sonarr and Radarr send no `Origin` and are unaffected.
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 fn default_rss_history_limit() -> Option<usize> {
@@ -231,6 +237,7 @@ impl Default for GeneralConfig {
             script_max_output_bytes: default_script_output_bytes(),
             fetch_allow_private: false,
             fetch_allowed_hosts: Vec::new(),
+            cors_allowed_origins: Vec::new(),
         }
     }
 }

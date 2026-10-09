@@ -7,12 +7,13 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use base64::Engine;
-use http::{HeaderMap, StatusCode, header};
+use http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use rust_embed::Embed;
 use tokio::net::TcpListener;
-use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -114,11 +115,89 @@ fn is_hashed_asset(path: &str) -> bool {
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
+/// Content Security Policy sent with every response.
+///
+/// The SPA keeps its bearer token in `localStorage`, so this is the defence in
+/// depth against injected script. Scripts load only from this origin: the
+/// production build disables Angular's critical-CSS inlining, which would
+/// otherwise emit an inline `onload` handler. Styles need `'unsafe-inline'`
+/// because Angular injects component styles at runtime and inlines the
+/// Google Fonts stylesheets into `index.html`; the font files themselves come
+/// from fonts.gstatic.com. `data:`/`blob:` images cover Swagger UI's icons.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+     script-src 'self'; \
+     style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; \
+     font-src 'self' https://fonts.gstatic.com data:; \
+     img-src 'self' data: blob:; \
+     connect-src 'self'; \
+     object-src 'none'; \
+     base-uri 'self'; \
+     form-action 'self'; \
+     frame-ancestors 'none'";
+
+/// Add the browser security headers (CSP, framing, MIME sniffing, referrer)
+/// to every response from `router` that does not already set them.
+pub fn with_security_headers<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_FRAME_OPTIONS,
+            HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::REFERRER_POLICY,
+            HeaderValue::from_static("no-referrer"),
+        ))
+}
+
+/// CORS policy for the API: same-origin only unless
+/// `general.cors_allowed_origins` lists browser origins to admit.
+///
+/// The web UI is served from this origin and *arr clients call the SABnzbd
+/// API server-to-server (no `Origin`, so CORS never applies to them); neither
+/// needs cross-origin grants. A literal `"*"` entry restores the old
+/// allow-any behaviour for setups that explicitly want it.
+fn api_cors_layer(configured: &[String]) -> CorsLayer {
+    let base = CorsLayer::new()
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request());
+    if configured.iter().any(|o| o.trim() == "*") {
+        warn!("general.cors_allowed_origins contains \"*\": any website may call the API");
+        return base.allow_origin(AllowOrigin::any());
+    }
+    let origins: Vec<HeaderValue> = configured
+        .iter()
+        .map(|o| o.trim().trim_end_matches('/'))
+        .filter(|o| !o.is_empty())
+        .filter_map(|o| match HeaderValue::from_str(o) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                warn!("Ignoring invalid general.cors_allowed_origins entry {o:?}");
+                None
+            }
+        })
+        .collect();
+    base.allow_origin(AllowOrigin::list(origins))
+}
+
 /// Build the axum Router with all API routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::default()
+    let cors = api_cors_layer(&state.config().general.cors_allowed_origins);
+    // The health probe carries no data and is polled cross-origin by the
+    // desktop shell's splash page before it navigates to the UI.
+    let health_cors = CorsLayer::new()
         .allow_origin(AllowOrigin::any())
-        .allow_headers(AllowHeaders::any());
+        .allow_methods([Method::GET]);
 
     // Auth endpoints (no auth middleware on these)
     let auth_routes = Router::new()
@@ -401,11 +480,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         },
     );
 
-    Router::new()
+    let router = Router::new()
         // Root serves index.html
         .route("/", get(h_root))
         // Health check — no auth (Docker HEALTHCHECK)
-        .route("/api/health", get(handlers::h_health))
+        .route("/api/health", get(handlers::h_health).layer(health_cors))
         // Auth endpoints — no auth middleware
         .nest("/api", auth_routes)
         // Protected API routes
@@ -418,7 +497,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+    with_security_headers(router)
 }
 
 /// Start the HTTP server with a default router.
