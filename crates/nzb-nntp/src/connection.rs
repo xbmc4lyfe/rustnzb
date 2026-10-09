@@ -1503,7 +1503,9 @@ impl NntpConnection {
                     value: parse_lossless_overview_rows(&data, format, start, end),
                 })
             }
-            420 => {
+            // 420 (RFC 2980) and 423 "No articles in that range" (RFC 3977
+            // section 8.3.2, e.g. an expired range) both mean an empty result.
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
                 Ok(BoundedResponse {
                     value: LosslessOverviewRows {
@@ -1582,9 +1584,11 @@ impl NntpConnection {
                 );
                 Ok(entries)
             }
-            420 => {
+            // 420 (RFC 2980) and 423 "No articles in that range" (RFC 3977
+            // section 8.3.2, e.g. an expired range) both mean an empty result.
+            420 | 423 => {
                 self.state = ConnectionState::Ready;
-                Ok(Vec::new()) // No articles in range
+                Ok(Vec::new())
             }
             412 => {
                 self.state = ConnectionState::Ready;

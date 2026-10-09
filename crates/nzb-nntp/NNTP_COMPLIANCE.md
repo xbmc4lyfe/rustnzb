@@ -144,6 +144,7 @@ This document validates the `nzb-nntp` crate's alignment with the relevant NNTP 
 | Message-ID angle brackets stripped | **Compliant** | `trim_matches` removes `<>` |
 | 412 = no newsgroup selected | **Compliant** | Mapped to `NntpError::NoSuchGroup` |
 | 420 = no articles in range | **Compliant** | Returns empty `Vec` (not an error) |
+| 423 = no articles in that range (RFC 3977 §8.3.2) | **Compliant** | Returns empty `Vec` (not an error), e.g. for an expired range |
 | Malformed lines skipped | **Compliant** | Lines with < 8 tab-separated fields are ignored |
 
 ### XHDR (Section 2.6)
