@@ -405,6 +405,91 @@ impl Database {
             )?;
         }
 
+        if version < 14 {
+            info!("Applying database migration v14: unique newsgroup headers");
+            self.migrate_v14_unique_group_headers()?;
+        }
+
+        Ok(())
+    }
+
+    /// Migration v14 (BUG-105, BUG-107): de-duplicate newsgroup headers and
+    /// add the unique `(group_id, message_id)` index that makes header
+    /// inserts idempotent, plus the per-group record of which server the
+    /// scan watermark was measured on.
+    ///
+    /// Self-contained and idempotent: every statement tolerates having
+    /// already run, and the newsgroup tables may be absent entirely (builds
+    /// without the `groups-db` feature, or partial schemas in tests).
+    fn migrate_v14_unique_group_headers(&self) -> Result<(), NzbError> {
+        let table_exists = |name: &str| -> Result<bool, NzbError> {
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![name],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        };
+
+        // A SAVEPOINT rather than BEGIN, so the step stays atomic on its own
+        // and also nests inside a caller-provided migration transaction.
+        self.conn.execute_batch("SAVEPOINT migrate_v14;")?;
+        let applied = self.migrate_v14_steps(&table_exists);
+        match applied {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE migrate_v14;")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO migrate_v14; RELEASE migrate_v14;");
+                Err(error)
+            }
+        }
+    }
+
+    fn migrate_v14_steps(
+        &self,
+        table_exists: &dyn Fn(&str) -> Result<bool, NzbError>,
+    ) -> Result<(), NzbError> {
+        let tx = &self.conn;
+        if table_exists("headers")? {
+            // Keep the oldest copy of each duplicate, but carry over the read
+            // flag if any copy was read. Deleting the extra rows fires the
+            // FTS delete trigger, so the search index is cleaned up as well.
+            tx.execute_batch(
+                "
+                UPDATE headers SET read = 1
+                 WHERE read = 0
+                   AND EXISTS (SELECT 1 FROM headers d
+                                WHERE d.group_id = headers.group_id
+                                  AND d.message_id = headers.message_id
+                                  AND d.read = 1);
+                DELETE FROM headers
+                 WHERE id NOT IN (SELECT MIN(id) FROM headers
+                                   GROUP BY group_id, message_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_headers_group_msgid
+                    ON headers(group_id, message_id);
+                ",
+            )?;
+        }
+        if table_exists("groups")? {
+            let has_column: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('groups') WHERE name = 'scan_server_id'",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_column == 0 {
+                tx.execute_batch("ALTER TABLE groups ADD COLUMN scan_server_id TEXT;")?;
+            }
+        }
+        tx.execute_batch(
+            "
+            DELETE FROM schema_version;
+            INSERT INTO schema_version (version) VALUES (14);
+            ",
+        )?;
         Ok(())
     }
 

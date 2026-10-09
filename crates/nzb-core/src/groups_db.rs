@@ -129,12 +129,40 @@ impl Database {
         Ok(())
     }
 
-    pub fn group_update_watermark(&self, id: i64, last_scanned: i64) -> Result<(), NzbError> {
+    /// Record how far a group has been scanned, and on which server.
+    ///
+    /// Article numbers are per-server, so the watermark is only meaningful
+    /// together with the server it was measured on; see
+    /// [`Database::group_scan_server`].
+    pub fn group_update_watermark(
+        &self,
+        id: i64,
+        last_scanned: i64,
+        server_id: &str,
+    ) -> Result<(), NzbError> {
         self.conn.execute(
-            "UPDATE groups SET last_scanned = ?2, last_updated = datetime('now') WHERE id = ?1",
-            params![id, last_scanned],
+            "UPDATE groups SET last_scanned = ?2, scan_server_id = ?3, last_updated = datetime('now')
+             WHERE id = ?1",
+            params![id, last_scanned, server_id],
         )?;
         Ok(())
+    }
+
+    /// The server the group's `last_scanned` watermark belongs to, if any.
+    pub fn group_scan_server(&self, id: i64) -> Result<Option<String>, NzbError> {
+        let server = self
+            .conn
+            .query_row(
+                "SELECT scan_server_id FROM groups WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(NzbError::Database);
+        match server {
+            Ok(server) => Ok(server),
+            Err(NzbError::Database(rusqlite::Error::QueryReturnedNoRows)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     // ---- Headers ----
@@ -152,7 +180,9 @@ impl Database {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for e in entries {
-                stmt.execute(params![
+                // `OR IGNORE` against the unique (group_id, message_id) index:
+                // headers already stored are skipped, not duplicated.
+                count += stmt.execute(params![
                     group_id,
                     e.article_num as i64,
                     e.subject,
@@ -162,12 +192,41 @@ impl Database {
                     e.references,
                     e.bytes as i64,
                     e.lines as i64,
-                ])?;
-                count += 1;
+                ])? as u64;
             }
         }
         tx.commit()?;
         Ok(count)
+    }
+
+    /// Delete all but the `keep` newest headers (by article number) of a
+    /// group. `keep == 0` means unlimited. Returns the number deleted.
+    pub fn header_prune_group(&self, group_id: i64, keep: usize) -> Result<u64, NzbError> {
+        if keep == 0 {
+            return Ok(0);
+        }
+        let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+        let deleted = self.conn.execute(
+            "DELETE FROM headers WHERE id IN (
+                SELECT id FROM headers WHERE group_id = ?1
+                 ORDER BY article_num DESC, id DESC
+                 LIMIT -1 OFFSET ?2)",
+            params![group_id, keep],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    /// Delete every stored header of a group and reset its scan watermark, so
+    /// the next fetch starts from scratch. Returns the number deleted.
+    pub fn header_clear_group(&self, group_id: i64) -> Result<u64, NzbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let deleted = tx.execute("DELETE FROM headers WHERE group_id = ?1", params![group_id])?;
+        tx.execute(
+            "UPDATE groups SET last_scanned = 0, scan_server_id = NULL WHERE id = ?1",
+            params![group_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted as u64)
     }
 
     pub fn header_list(
@@ -481,5 +540,159 @@ mod tests {
         assert_eq!(threads[0].reply_count, 1);
         assert_eq!(threads[0].unread_count, 1);
         assert_eq!(db.group_get(group.id).unwrap().unwrap().unread_count, 1);
+    }
+
+    fn entry(article_num: u64, message_id: &str) -> XoverEntry {
+        XoverEntry {
+            article_num,
+            subject: format!("Subject {article_num}"),
+            from: "poster".into(),
+            date: "2026-01-01".into(),
+            message_id: message_id.into(),
+            references: "".into(),
+            bytes: 1,
+            lines: 1,
+        }
+    }
+
+    fn seeded_group(db: &Database) -> i64 {
+        db.group_upsert_batch(&[("alt.binaries.test".into(), 30, 10)])
+            .unwrap();
+        db.group_list(false, None, 10, 0).unwrap().pop().unwrap().id
+    }
+
+    /// BUG-105: two overlapping fetches of one group (or a re-fetch) must not
+    /// store every header twice — that doubled thread, unread and FTS counts.
+    #[test]
+    fn inserting_the_same_headers_twice_does_not_duplicate_them() {
+        let db = Database::open_memory().unwrap();
+        let group_id = seeded_group(&db);
+        let batch = [entry(10, "<a@test>"), entry(11, "<b@test>")];
+
+        assert_eq!(db.header_insert_batch(group_id, &batch).unwrap(), 2);
+        assert_eq!(
+            db.header_insert_batch(group_id, &batch).unwrap(),
+            0,
+            "re-inserting existing headers reports nothing stored"
+        );
+
+        assert_eq!(db.header_count(group_id, None).unwrap(), 2);
+        assert_eq!(db.header_unread_count(group_id).unwrap(), 2);
+        assert_eq!(db.header_count(group_id, Some("Subject")).unwrap(), 2);
+        let (_, threads) = db.header_list_threads(group_id, 10, 0).unwrap();
+        assert_eq!(threads, 2);
+    }
+
+    /// BUG-105: databases that already hold duplicate headers are de-duplicated
+    /// by the migration that adds the unique index, keeping read state.
+    #[test]
+    fn migration_removes_existing_duplicate_headers_and_keeps_read_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.db");
+        let group_id = {
+            let db = Database::open(&path).unwrap();
+            seeded_group(&db)
+        };
+
+        // Recreate the pre-fix state: no unique index, duplicated rows (one
+        // copy read), schema version before the de-duplicating migration.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("DROP INDEX IF EXISTS idx_headers_group_msgid;")
+            .unwrap();
+        for read in [0, 1, 0] {
+            conn.execute(
+                "INSERT INTO headers (group_id, article_num, subject, author, date, message_id, read)
+                 VALUES (?1, 10, 'Dup', 'poster', '2026-01-01', '<dup@test>', ?2)",
+                params![group_id, read],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO headers (group_id, article_num, subject, author, date, message_id)
+             VALUES (?1, 11, 'Single', 'poster', '2026-01-01', '<single@test>')",
+            params![group_id],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (13);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.header_count(group_id, None).unwrap(), 2);
+        assert_eq!(
+            db.header_count(group_id, Some("Dup")).unwrap(),
+            1,
+            "FTS rows of removed duplicates are removed too"
+        );
+        assert_eq!(db.header_unread_count(group_id).unwrap(), 1);
+        let dup = db.header_get_by_message_id("<dup@test>").unwrap().unwrap();
+        assert!(
+            dup.read,
+            "a duplicate that was read keeps the survivor read"
+        );
+        assert_eq!(
+            db.header_insert_batch(group_id, &[entry(10, "<dup@test>")])
+                .unwrap(),
+            0,
+            "the unique index now rejects the duplicate"
+        );
+    }
+
+    /// BUG-105: headers are pruned to the configured per-group maximum, oldest
+    /// article numbers first.
+    #[test]
+    fn prune_keeps_only_the_newest_headers_of_a_group() {
+        let db = Database::open_memory().unwrap();
+        let group_id = seeded_group(&db);
+        let batch: Vec<_> = (1..=5).map(|n| entry(n, &format!("<{n}@test>"))).collect();
+        db.header_insert_batch(group_id, &batch).unwrap();
+
+        assert_eq!(
+            db.header_prune_group(group_id, 0).unwrap(),
+            0,
+            "0 = keep all"
+        );
+        assert_eq!(db.header_prune_group(group_id, 3).unwrap(), 2);
+        let kept: Vec<i64> = db
+            .header_list(group_id, None, 10, 0)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.article_num)
+            .collect();
+        assert_eq!(kept, vec![5, 4, 3]);
+        assert_eq!(db.header_count(group_id, Some("Subject")).unwrap(), 3);
+    }
+
+    /// BUG-105: clearing a group's headers deletes them and resets the scan
+    /// watermark so the next fetch starts over.
+    #[test]
+    fn clearing_a_group_deletes_headers_and_resets_the_watermark() {
+        let db = Database::open_memory().unwrap();
+        let group_id = seeded_group(&db);
+        db.header_insert_batch(group_id, &[entry(10, "<a@test>")])
+            .unwrap();
+        db.group_update_watermark(group_id, 10, "server-a").unwrap();
+
+        assert_eq!(db.header_clear_group(group_id).unwrap(), 1);
+        assert_eq!(db.header_count(group_id, None).unwrap(), 0);
+        let group = db.group_get(group_id).unwrap().unwrap();
+        assert_eq!(group.last_scanned, 0);
+        assert_eq!(db.group_scan_server(group_id).unwrap(), None);
+    }
+
+    /// BUG-107: the watermark records which server it was measured against.
+    #[test]
+    fn watermark_remembers_the_server_it_belongs_to() {
+        let db = Database::open_memory().unwrap();
+        let group_id = seeded_group(&db);
+        assert_eq!(db.group_scan_server(group_id).unwrap(), None);
+        db.group_update_watermark(group_id, 42, "server-a").unwrap();
+        assert_eq!(
+            db.group_scan_server(group_id).unwrap().as_deref(),
+            Some("server-a")
+        );
+        assert_eq!(db.group_get(group_id).unwrap().unwrap().last_scanned, 42);
     }
 }

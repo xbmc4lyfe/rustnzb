@@ -282,7 +282,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/groups/{id}/unsubscribe",
             post(group_handlers::h_group_unsubscribe),
         )
-        .route("/groups/{id}/headers", get(group_handlers::h_header_list))
+        .route(
+            "/groups/{id}/headers",
+            get(group_handlers::h_header_list).delete(group_handlers::h_header_clear),
+        )
         .route(
             "/groups/{id}/headers/fetch",
             post(group_handlers::h_header_fetch),
