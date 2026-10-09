@@ -1507,8 +1507,12 @@ impl QueueManager {
             nzb_data: nzb_data.as_ref().map(|data| Arc::new(data.clone())),
         });
 
+        // A job admitted as Paused (e.g. SABnzbd priority -2) stays paused
+        // individually: it must not start, and Resume All must not resume it.
+        let requested_paused = job.status == JobStatus::Paused;
+
         // If globally paused, add as paused
-        if self.globally_paused.load(Ordering::Relaxed) {
+        if requested_paused || self.globally_paused.load(Ordering::Relaxed) {
             job.status = JobStatus::Paused;
             let state = JobState {
                 job,
@@ -1521,8 +1525,10 @@ impl QueueManager {
                 failure_code: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
-            self.globally_paused_jobs.lock().insert(job_id.clone());
-            self.persist_globally_paused_jobs();
+            if !requested_paused {
+                self.globally_paused_jobs.lock().insert(job_id.clone());
+                self.persist_globally_paused_jobs();
+            }
             self.job_order.lock().push(job_id);
             return;
         }
