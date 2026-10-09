@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.4.22"
+version = "0.4.23"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
@@ -46,6 +46,8 @@ regex = "1"
 libc = "0.2"
 unicode-normalization = "0.1"
 flate2.workspace = true
+zip.workspace = true
+bzip2.workspace = true
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
