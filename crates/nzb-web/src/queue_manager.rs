@@ -2523,6 +2523,7 @@ impl QueueManager {
             direct_unpacker,
             password,
             content_articles_failed,
+            delete_archives,
         ) = {
             let mut jobs = self.jobs.lock();
             let Some(state) = jobs.get_mut(job_id) else {
@@ -2557,6 +2558,7 @@ impl QueueManager {
                 du,
                 pw,
                 content_failed,
+                state.job.delete_archives.unwrap_or(true),
             )
         };
         // Record the reserved folder so a restart resumes into it.
@@ -2648,6 +2650,7 @@ impl QueueManager {
                 .unwrap_or_default();
             let config = PostProcConfig {
                 cleanup_after_extract: true,
+                delete_archives,
                 output_dir: Some(output_dir.clone()),
                 articles_failed,
                 content_articles_failed,
@@ -3009,6 +3012,7 @@ impl QueueManager {
             failure_code: (final_status == JobStatus::Failed)
                 .then(|| state.failure_code.unwrap_or(JobFailureCode::DownloadFailed)),
             post_processing: Some(pp_level),
+            delete_archives: state.job.delete_archives,
             server_stats: state.job.server_stats.clone(),
             nzb_data: state.nzb_data.clone(),
             retry_data,
@@ -3487,6 +3491,7 @@ impl QueueManager {
                         state.failure_code.unwrap_or(JobFailureCode::DownloadFailed),
                     ),
                     post_processing: Some(self.post_processing_level(&state.job)),
+                    delete_archives: state.job.delete_archives,
                     server_stats: state.job.server_stats.clone(),
                     nzb_data: state.nzb_data.clone(),
                     retry_data: None,
@@ -4935,6 +4940,7 @@ mod global_pause_tests {
             error_message: None,
             speed_bps: 0,
             pp_override: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             files: Vec::new(),
         }
@@ -5131,6 +5137,7 @@ mod global_pause_tests {
             error_message: None,
             failure_code: None,
             post_processing: None,
+            delete_archives: None,
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
