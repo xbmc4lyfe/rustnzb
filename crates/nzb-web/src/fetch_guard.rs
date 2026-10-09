@@ -54,7 +54,7 @@ pub async fn validate_fetch_url(raw_url: &str) -> Result<FetchUrlPlan, ApiError>
 
     // IP literal: validate directly without a DNS round-trip.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if !is_globally_routable(ip) {
+        if !is_globally_routable(ip) && !loopback_allowed_for_tests(ip) {
             return Err(ApiError::from(anyhow::anyhow!(
                 "URL targets a private/reserved address"
             )));
@@ -139,6 +139,30 @@ pub async fn read_response_bytes_limited(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Unit-test seam: inside `ALLOW_LOOPBACK_FOR_TESTS.scope(true, ..)`,
+    /// literal loopback URLs pass the guard so tests can fetch from a local
+    /// fixture server. Compiled only into this crate's unit tests; the
+    /// guard is unchanged in every other build.
+    pub(crate) static ALLOW_LOOPBACK_FOR_TESTS: bool;
+}
+
+fn loopback_allowed_for_tests(ip: IpAddr) -> bool {
+    #[cfg(test)]
+    {
+        ip.is_loopback()
+            && ALLOW_LOOPBACK_FOR_TESTS
+                .try_with(|allow| *allow)
+                .unwrap_or(false)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = ip;
+        false
+    }
 }
 
 fn is_globally_routable(ip: IpAddr) -> bool {
