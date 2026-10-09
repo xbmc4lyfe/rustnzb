@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-core"
-version = "0.2.18"
+version = "0.2.19"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "nzb-dispatch"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "arc-swap",
