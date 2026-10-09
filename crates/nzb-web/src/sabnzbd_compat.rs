@@ -964,6 +964,8 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "retry" => handle_retry(state, req),
 
+        "retry_all" => handle_retry_all(state),
+
         // SABnzbd `_api_warnings`. RustNZB does not keep a SABnzbd-style
         // warnings list (queue/fullstatus report `have_warnings: "0"` and
         // `warnings: []`), so this is the same empty list; `name=clear`
@@ -2020,45 +2022,63 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         return Json(serde_json::json!({ "status": false, "error": "History job not found" }));
     };
 
+    match retry_history_job(state, &entry) {
+        Ok(nzo_id) => Json(serde_json::json!({ "status": true, "nzo_ids": [nzo_id] })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error })),
+    }
+}
+
+/// SABnzbd `_api_retry_all`: retry every history entry that history reports
+/// as retryable (`retry: true`). SABnzbd 5.0.4 answers with
+/// `{"status": [nzo_id, ...]}`, one element per attempted entry and `null`
+/// where that retry failed, so this does the same.
+fn handle_retry_all(state: &AppState) -> Json<serde_json::Value> {
+    let entries = state
+        .queue_manager
+        .history_list(i64::MAX as usize)
+        .unwrap_or_default();
+    let nzo_ids: Vec<Option<String>> = entries
+        .iter()
+        .filter(|entry| entry.status == JobStatus::Failed && entry.nzb_data.is_some())
+        .map(|entry| {
+            retry_history_job(state, entry)
+                .inspect_err(|error| {
+                    tracing::warn!(history_id = %entry.id, %error, "retry_all: retry failed");
+                })
+                .ok()
+        })
+        .collect();
+    Json(serde_json::json!({ "status": nzo_ids }))
+}
+
+/// Re-queue one history entry from its stored NZB, returning the new SAB
+/// `nzo_id`. Shared by `mode=retry` and `mode=retry_all`.
+fn retry_history_job(state: &AppState, entry: &HistoryEntry) -> Result<String, String> {
     let data = match state.queue_manager.history_get_nzb_data(&entry.id) {
         Ok(Some(data)) => data,
         Ok(None) => {
-            return Json(serde_json::json!({
-                "status": false,
-                "error": "The original NZB data is unavailable for this history job"
-            }));
+            return Err("The original NZB data is unavailable for this history job".into());
         }
-        Err(error) => {
-            return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
-        }
+        Err(error) => return Err(error.to_string()),
     };
 
-    let retry_data = match state.queue_manager.history_get_retry_data(&entry.id) {
-        Ok(data) => data,
-        Err(error) => {
-            return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
-        }
-    };
-    let job = match state
+    let retry_data = state
         .queue_manager
-        .prepare_retry_job(&entry, &data, retry_data.as_deref())
-    {
-        Ok(job) => job,
-        Err(error) => {
-            return Json(serde_json::json!({
-                "status": false,
-                "error": format!("Failed to parse stored NZB: {error}")
-            }));
-        }
-    };
+        .history_get_retry_data(&entry.id)
+        .map_err(|error| error.to_string())?;
+    let job = state
+        .queue_manager
+        .prepare_retry_job(entry, &data, retry_data.as_deref())
+        .map_err(|error| format!("Failed to parse stored NZB: {error}"))?;
 
     let nzo_id = format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id));
-    if let Err(error) = state.queue_manager.add_job(job, Some(data)) {
-        return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
-    }
+    state
+        .queue_manager
+        .add_job(job, Some(data))
+        .map_err(|error| error.to_string())?;
 
     tracing::info!(history_id = %entry.id, retried_id = %nzo_id, "History job retried via arr API");
-    Json(serde_json::json!({ "status": true, "nzo_ids": [nzo_id] }))
+    Ok(nzo_id)
 }
 
 fn handle_switch(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
@@ -4667,6 +4687,37 @@ mod tests {
         .0;
         assert_eq!(delete["status"], serde_json::json!(true));
         assert!(!history_ids(&test_state).contains(&"oldest-failed".to_string()));
+    }
+
+    /// `mode=retry_all` re-queues every retryable failed history entry and
+    /// answers like SABnzbd 5.0.4 `_api_retry_all`: `{"status": [nzo_ids]}`.
+    #[tokio::test]
+    async fn retry_all_requeues_every_failed_history_entry() {
+        let test_state = test_state();
+
+        let empty = dispatch_mode(&test_state.state, "retry_all", &SabApiRequest::default()).0;
+        assert_eq!(empty, serde_json::json!({ "status": [] }));
+
+        for id in ["failed-one", "failed-two"] {
+            let mut entry = history_entry(id, id, "tv", JobStatus::Failed, 60);
+            entry.nzb_data = Some(SAMPLE_NZB.as_bytes().to_vec());
+            test_state
+                .state
+                .queue_manager
+                .with_db(|database| database.history_insert(&entry).expect("insert history"));
+        }
+        insert_history_status(&test_state, "completed-one", JobStatus::Completed, 30);
+
+        let response = dispatch_mode(&test_state.state, "retry_all", &SabApiRequest::default()).0;
+        let ids = response["status"].as_array().expect("status is a list");
+        assert_eq!(ids.len(), 2, "response={response}");
+        for id in ids {
+            assert!(
+                id.as_str().is_some_and(|id| id.starts_with("SABnzbd_nzo_")),
+                "response={response}"
+            );
+        }
+        assert_eq!(test_state.state.queue_manager.get_jobs().len(), 2);
     }
 
     /// Without `del_files`, history delete only removes the DB record, as
