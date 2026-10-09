@@ -60,6 +60,57 @@ fn create_data_dir(path: &Path) -> anyhow::Result<()> {
     })
 }
 
+/// Exclusive lock on `<data_dir>/rustnzb.lock`, held for the life of the
+/// engine so a second instance cannot share the data directory. Two engines
+/// on one data dir would both resume the same downloads and post-processing
+/// and write into the same work directories.
+pub(crate) struct InstanceLock {
+    _file: std::fs::File,
+}
+
+/// Take the data-dir instance lock, failing fast if another process holds it.
+/// The OS releases the lock when the file is closed, including on a crash,
+/// so a stale lock file never blocks startup.
+fn acquire_instance_lock(data_dir: &Path) -> anyhow::Result<InstanceLock> {
+    let path = data_dir.join("rustnzb.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Deny every other open while this handle lives.
+        options.share_mode(0);
+    }
+    let in_use = || {
+        anyhow::anyhow!(
+            "another rustnzb instance is using {}; stop it or choose a different data_dir",
+            data_dir.display()
+        )
+    };
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        // ERROR_SHARING_VIOLATION: another instance holds the file open.
+        #[cfg(windows)]
+        Err(e) if e.raw_os_error() == Some(32) => return Err(in_use()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to open lock file {}", path.display()));
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `file` owns a valid open descriptor for the whole call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Err(in_use());
+            }
+            return Err(err).with_context(|| format!("Failed to lock {}", path.display()));
+        }
+    }
+    Ok(InstanceLock { _file: file })
+}
+
 /// Configuration for engine initialization.
 ///
 /// All fields except `config_path` are optional overrides —
@@ -137,6 +188,9 @@ pub async fn initialize(
 
     // Ensure directories exist
     create_data_dir(&config.general.data_dir)?;
+    // Claim the data dir before anything else touches it: opening the DB
+    // resumes queued downloads and interrupted post-processing.
+    let instance_lock = acquire_instance_lock(&config.general.data_dir)?;
     create_data_dir(&config.general.incomplete_dir)?;
     create_data_dir(&config.general.complete_dir)?;
 
@@ -226,14 +280,17 @@ pub async fn initialize(
     tokio::spawn(async move { monitor.run().await });
 
     // Build shared application state
-    let state = Arc::new(AppState::new(
-        shared_config,
-        config_path,
-        Arc::clone(&queue_manager),
-        log_buffer.clone(),
-        token_store,
-        credential_store,
-    ));
+    let state = Arc::new(
+        AppState::new(
+            shared_config,
+            config_path,
+            Arc::clone(&queue_manager),
+            log_buffer.clone(),
+            token_store,
+            credential_store,
+        )
+        .with_instance_lock(instance_lock),
+    );
 
     Ok(StartupResult {
         state,
@@ -244,7 +301,7 @@ pub async fn initialize(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_data_dir, sanitize_loaded_config};
+    use super::{StartupConfig, create_data_dir, initialize, sanitize_loaded_config};
     use crate::nzb_core::config::AppConfig;
     use crate::nzb_core::config::ServerConfig;
 
@@ -290,6 +347,63 @@ mod tests {
             debug_text.contains("Caused by"),
             "error should retain the underlying io::Error in the chain, got: {debug_text}"
         );
+    }
+
+    /// Write a config that shares `data_dir` but has its own download dirs,
+    /// so a test can tell whether initialization got far enough to touch them.
+    fn write_instance_config(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let mut config = AppConfig::default();
+        config.general.data_dir = root.join("data");
+        config.general.incomplete_dir = root.join(name).join("incomplete");
+        config.general.complete_dir = root.join(name).join("complete");
+        let path = root.join(format!("{name}.toml"));
+        config.save(&path).unwrap();
+        path
+    }
+
+    fn startup_config(config_path: std::path::PathBuf) -> StartupConfig {
+        StartupConfig {
+            config_path,
+            listen_addr: None,
+            port: None,
+            data_dir: None,
+            log_level: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn second_instance_on_same_data_dir_fails_before_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_config = write_instance_config(tmp.path(), "first");
+        let second_config = write_instance_config(tmp.path(), "second");
+
+        let first = initialize(startup_config(first_config), None)
+            .await
+            .expect("first instance should start");
+
+        let err = match initialize(startup_config(second_config.clone()), None).await {
+            Ok(_) => panic!("second instance on the same data_dir must not start"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("another rustnzb instance"),
+            "error should explain the conflict, got: {err}"
+        );
+        assert!(
+            err.contains(&tmp.path().join("data").display().to_string()),
+            "error should name the data dir, got: {err}"
+        );
+        // The second instance bailed out before creating its download dirs,
+        // i.e. before opening the database or starting any queue work.
+        assert!(!tmp.path().join("second").join("incomplete").exists());
+        assert!(!tmp.path().join("second").join("complete").exists());
+
+        // Shutting the first instance down releases the lock.
+        drop(first);
+        initialize(startup_config(second_config), None)
+            .await
+            .expect("data_dir should be usable once the first instance is gone");
     }
 
     #[test]

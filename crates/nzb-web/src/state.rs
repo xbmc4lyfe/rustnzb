@@ -23,6 +23,8 @@ pub struct AppState {
     /// Serialises config writers so a read-modify-write cycle (including
     /// persisting the TOML) cannot interleave with another one.
     config_write: Mutex<()>,
+    /// Data-dir instance lock, held for as long as this state is alive.
+    _instance_lock: Option<crate::startup::InstanceLock>,
 }
 
 impl AppState {
@@ -43,7 +45,14 @@ impl AppState {
             credential_store,
             started_at: std::time::Instant::now(),
             config_write: Mutex::new(()),
+            _instance_lock: None,
         }
+    }
+
+    /// Keep the data-dir instance lock alive for the lifetime of this state.
+    pub(crate) fn with_instance_lock(mut self, lock: crate::startup::InstanceLock) -> Self {
+        self._instance_lock = Some(lock);
+        self
     }
 
     /// Get current config snapshot.
