@@ -1,11 +1,9 @@
-use std::io::{Cursor, Read as _};
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use flate2::read::GzDecoder;
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +19,6 @@ static HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::
         .expect("Failed to build shared HTTP client")
 });
 
-const MAX_NZB_DECOMPRESSED_BYTES: u64 = 100 * 1024 * 1024;
-
 #[cfg(feature = "webdav")]
 use nzb_web::nzb_core::config::DavConfig;
 use nzb_web::nzb_core::config::{
@@ -37,6 +33,7 @@ use nzb_web::fetch_guard::{
     MAX_FETCH_BODY_BYTES, build_fetch_client, read_response_bytes_limited, validate_fetch_url,
 };
 use nzb_web::log_buffer::LogEntry;
+use nzb_web::nzb_archive::extract_nzbs;
 use nzb_web::state::AppState;
 
 use crate::admissions::{IdempotencyKey, payload_digest};
@@ -288,81 +285,6 @@ pub async fn h_queue_list(
     }))
 }
 
-/// Extract NZB files from an uploaded file. If it's an archive (zip, gz),
-/// returns all `.nzb` entries found inside. Otherwise returns the file as-is.
-fn extract_nzbs(file_name: &str, data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, anyhow::Error> {
-    let lower = file_name.to_lowercase();
-
-    // .nzb.gz or .gz containing an nzb
-    if lower.ends_with(".gz") {
-        let mut decoder = GzDecoder::new(data);
-        let mut decompressed = Vec::new();
-        decoder
-            .by_ref()
-            .take(MAX_NZB_DECOMPRESSED_BYTES + 1)
-            .read_to_end(&mut decompressed)
-            .map_err(|e| anyhow::anyhow!("Failed to decompress gzip: {e}"))?;
-        if decompressed.len() as u64 > MAX_NZB_DECOMPRESSED_BYTES {
-            anyhow::bail!(
-                "Decompressed NZB exceeds the {} MB limit",
-                MAX_NZB_DECOMPRESSED_BYTES / 1024 / 1024
-            );
-        }
-        let inner_name = file_name
-            .strip_suffix(".gz")
-            .or_else(|| file_name.strip_suffix(".GZ"))
-            .unwrap_or(file_name);
-        return Ok(vec![(inner_name.to_string(), decompressed)]);
-    }
-
-    // .zip archive — extract all .nzb files inside
-    if lower.ends_with(".zip") {
-        let cursor = Cursor::new(data);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .map_err(|e| anyhow::anyhow!("Failed to read zip archive: {e}"))?;
-        let mut nzbs = Vec::new();
-        let mut total_uncompressed = 0u64;
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| anyhow::anyhow!("Zip entry error: {e}"))?;
-            let entry_name = entry.name().to_string();
-            if entry_name.to_lowercase().ends_with(".nzb") {
-                total_uncompressed = total_uncompressed
-                    .checked_add(entry.size())
-                    .ok_or_else(|| anyhow::anyhow!("Zip archive size overflow"))?;
-                if total_uncompressed > MAX_NZB_DECOMPRESSED_BYTES {
-                    anyhow::bail!(
-                        "Decompressed NZB exceeds the {} MB limit",
-                        MAX_NZB_DECOMPRESSED_BYTES / 1024 / 1024
-                    );
-                }
-
-                let mut buf = Vec::new();
-                entry
-                    .by_ref()
-                    .take(MAX_NZB_DECOMPRESSED_BYTES + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| anyhow::anyhow!("Failed to read zip entry '{entry_name}': {e}"))?;
-                if buf.len() as u64 > MAX_NZB_DECOMPRESSED_BYTES {
-                    anyhow::bail!(
-                        "Decompressed NZB exceeds the {} MB limit",
-                        MAX_NZB_DECOMPRESSED_BYTES / 1024 / 1024
-                    );
-                }
-                nzbs.push((entry_name, buf));
-            }
-        }
-        if nzbs.is_empty() {
-            anyhow::bail!("No .nzb files found in zip archive '{file_name}'");
-        }
-        return Ok(nzbs);
-    }
-
-    // Plain .nzb or unrecognized — pass through as-is
-    Ok(vec![(file_name.to_string(), data.to_vec())])
-}
-
 /// Enqueue a single NZB from raw bytes, applying category/priority from query params.
 async fn next_uploaded_file(
     multipart: &mut Multipart,
@@ -434,7 +356,7 @@ fn enqueue_nzb(
 }
 
 /// POST /api/queue/add -- Add NZB file(s) to the queue.
-/// Accepts `.nzb` files directly, or `.zip`/`.gz` archives containing `.nzb` files.
+/// Accepts `.nzb` files directly, or `.zip`/`.gz`/`.bz2` archives containing `.nzb` files.
 /// Multiple files can be uploaded in a single multipart request.
 pub async fn h_queue_add(
     State(state): State<Arc<AppState>>,
@@ -466,7 +388,7 @@ pub async fn h_queue_add(
         )?);
     } else {
         while let Some((file_name, data)) = next_uploaded_file(&mut multipart).await? {
-            // Extract NZBs (handles zip/gz archives or plain .nzb)
+            // Extract NZBs (handles zip/gz/bz2 archives or plain .nzb)
             for (nzb_name, nzb_data) in extract_nzbs(&file_name, &data).map_err(ApiError::from)? {
                 nzo_ids.push(enqueue_nzb(&state, &q, &nzb_name, nzb_data, None)?);
             }
@@ -2297,12 +2219,10 @@ pub async fn h_dav_config_set(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MAX_NZB_DECOMPRESSED_BYTES, MAX_RSS_REGEX_LEN, compile_rss_regex, extract_nzbs,
-        sanitize_server_config,
-    };
+    use super::{MAX_RSS_REGEX_LEN, compile_rss_regex, extract_nzbs, sanitize_server_config};
     use std::io::Write;
 
+    use nzb_web::nzb_archive::MAX_NZB_DECOMPRESSED_BYTES;
     use nzb_web::nzb_core::config::ServerConfig;
     use zip::CompressionMethod;
     use zip::write::SimpleFileOptions;
