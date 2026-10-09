@@ -1128,6 +1128,10 @@ export class QueueViewComponent implements OnInit, OnDestroy {
   }
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  /** Sequence number of the most recently issued /queue request. */
+  private queueRequestSeq = 0;
+  /** /queue responses for requests numbered <= this are stale and dropped. */
+  private queueStaleThrough = 0;
   private connectionHoldTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly connectionHold = new Map<string, { count: number; expiresAt: number }>();
   connectionClock = signal(Date.now());
@@ -1172,7 +1176,7 @@ export class QueueViewComponent implements OnInit, OnDestroy {
       }
     });
     this.loadAll();
-    this.pollTimer = setInterval(() => this.loadQueue(), 2000);
+    this.pollTimer = setInterval(() => this.fetchQueue(false), 2000);
     this.toggleSub = this.addNzbService.panelToggle$.subscribe(() => {
       this.showAddPanel = !this.showAddPanel;
     });
@@ -1191,9 +1195,24 @@ export class QueueViewComponent implements OnInit, OnDestroy {
     this.loadServers();
   }
 
+  /**
+   * Explicit reload (on init and after every mutation). It supersedes polls
+   * already in flight: those may have been answered before the mutation
+   * landed and would briefly restore the old rows.
+   */
   loadQueue(): void {
+    this.fetchQueue(true);
+  }
+
+  private fetchQueue(supersedeInFlight: boolean): void {
+    const seq = ++this.queueRequestSeq;
+    if (supersedeInFlight) this.queueStaleThrough = seq - 1;
     this.api.get<QueueResponse>('/queue').subscribe({
       next: (r) => {
+        // Drop out-of-order/superseded responses, and anything that would
+        // overwrite an optimistic reorder before the server has applied it.
+        if (seq <= this.queueStaleThrough || this.reorderPending()) return;
+        this.queueStaleThrough = seq;
         this.jobs.set(r.jobs);
         this.paused.set(r.paused);
         this.remainingBytes.set(
