@@ -5,11 +5,18 @@ use std::sync::Arc;
 use flate2::read::GzDecoder;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::queue_manager::QueueManager;
 
 const MAX_WATCHED_NZB_BYTES: usize = 100 * 1024 * 1024;
+/// Interval between the size checks that decide a dropped file is complete.
+const SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+/// Give up waiting for a file that never stops changing and process it anyway.
+const MAX_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// Suffix of a file the watcher has claimed. Claimed files are never picked
+/// up again, so an NZB is enqueued at most once even if the final move fails.
+const CLAIM_SUFFIX: &str = ".processing";
 
 pub struct DirWatcher {
     watch_dir: PathBuf,
@@ -61,8 +68,6 @@ impl DirWatcher {
                 EventKind::Create(_) | EventKind::Modify(_) => {
                     for path in &event.paths {
                         if Self::is_nzb_file(path) {
-                            // Small delay to ensure file is fully written
-                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             self.process_file(path).await;
                         }
                     }
@@ -93,87 +98,154 @@ impl DirWatcher {
             let path = entry.path();
             if Self::is_nzb_file(&path) {
                 self.process_file(&path).await;
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(CLAIM_SUFFIX))
+            {
+                warn!(
+                    file = %path.display(),
+                    "Found a claimed NZB left by an interrupted run; it may already be queued, so it is not imported again. Rename it to retry."
+                );
             }
         }
     }
 
-    async fn process_file(&self, path: &Path) {
-        info!(file = %path.display(), "Processing NZB from watch directory");
-
-        let raw_data = match Self::read_limited(path) {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(error = %e, file = %path.display(), "Failed to read NZB file");
-                return;
+    /// Wait until `path` stops changing: its size and modification time
+    /// must be identical across two checks `interval` apart. Returns `false`
+    /// if the file disappeared.
+    async fn wait_until_stable(path: &Path, interval: std::time::Duration) -> bool {
+        let snapshot = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .ok()
+                .map(|m| (m.len(), m.modified().ok()))
+        };
+        let started = tokio::time::Instant::now();
+        let Some(mut previous) = snapshot(path) else {
+            return false;
+        };
+        loop {
+            tokio::time::sleep(interval).await;
+            let Some(current) = snapshot(path) else {
+                return false;
+            };
+            if current == previous {
+                return true;
             }
+            if started.elapsed() >= MAX_SETTLE_WAIT {
+                warn!(file = %path.display(), "Watched file is still changing; processing it anyway");
+                return true;
+            }
+            previous = current;
+        }
+    }
+
+    /// Move `from` into `<watch_dir>/<subdir>/<file_name>`.
+    fn move_into(
+        &self,
+        from: &Path,
+        subdir: &str,
+        file_name: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        let dir = self.watch_dir.join(subdir);
+        std::fs::create_dir_all(&dir)?;
+        let dest = dir.join(file_name);
+        if std::fs::rename(from, &dest).is_err() {
+            // If rename fails (cross-device), try copy+delete
+            std::fs::copy(from, &dest).and_then(|_| std::fs::remove_file(from))?;
+        }
+        Ok(())
+    }
+
+    async fn process_file(&self, path: &Path) {
+        // Several events can fire for one file while it is being written; a
+        // later one finds it already claimed and gone.
+        if !Self::wait_until_stable(path, SETTLE_INTERVAL).await {
+            debug!(file = %path.display(), "Watched file vanished before it settled");
+            return;
+        }
+        let Some(file_name) = path.file_name().map(|name| name.to_os_string()) else {
+            return;
         };
 
-        let data = if Self::is_gz_nzb(path) {
+        // Claim the file before enqueueing so that, whatever happens next,
+        // it is never imported a second time.
+        let mut claimed_name = file_name.clone();
+        claimed_name.push(CLAIM_SUFFIX);
+        let claimed = path.with_file_name(&claimed_name);
+        if let Err(e) = std::fs::rename(path, &claimed) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(error = %e, file = %path.display(), "Failed to claim watched NZB");
+            }
+            return;
+        }
+
+        info!(file = %path.display(), "Processing NZB from watch directory");
+        let destination = match self.enqueue_claimed(path, &claimed).await {
+            Ok(()) => "processed",
+            Err(e) => {
+                warn!(error = %e, file = %path.display(), "Failed to import NZB from watch dir; moving it to failed/");
+                "failed"
+            }
+        };
+        if let Err(e) = self.move_into(&claimed, destination, &file_name) {
+            warn!(
+                error = %e,
+                file = %claimed.display(),
+                "Failed to move claimed NZB to {destination}/; it stays claimed and will not be imported again"
+            );
+        }
+    }
+
+    /// Read, parse and enqueue the claimed copy of `original`.
+    async fn enqueue_claimed(&self, original: &Path, claimed: &Path) -> Result<(), String> {
+        let raw_data = Self::read_limited(claimed).map_err(|e| format!("read failed: {e}"))?;
+
+        let data = if Self::is_gz_nzb(original) {
             let decoder = GzDecoder::new(raw_data.as_slice());
             let mut decompressed = Vec::new();
-            if let Err(error) = decoder
+            decoder
                 .take((MAX_WATCHED_NZB_BYTES as u64).saturating_add(1))
                 .read_to_end(&mut decompressed)
-            {
-                warn!(error = %error, file = %path.display(), "Failed to decompress watched NZB");
-                return;
-            }
+                .map_err(|e| format!("decompression failed: {e}"))?;
             if decompressed.len() > MAX_WATCHED_NZB_BYTES {
-                warn!(file = %path.display(), limit = MAX_WATCHED_NZB_BYTES, "Decompressed watched NZB exceeds the input limit");
-                return;
+                return Err(format!(
+                    "decompressed NZB exceeds the {MAX_WATCHED_NZB_BYTES} byte limit"
+                ));
             }
             decompressed
         } else {
             raw_data
         };
 
-        let name = if Self::is_gz_nzb(path) {
-            path.file_name()
+        let name = if Self::is_gz_nzb(original) {
+            original
+                .file_name()
                 .and_then(|name| name.to_str())
                 .and_then(|name| name.strip_suffix(".nzb.gz"))
                 .unwrap_or("unknown")
                 .to_string()
         } else {
-            path.file_stem()
+            original
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string()
         };
 
-        match crate::nzb_core::nzb_parser::parse_nzb(&name, &data) {
-            Ok(mut job) => {
-                job.work_dir = self.queue_manager.incomplete_dir().join(&job.id);
-                job.output_dir = self.queue_manager.complete_dir().join(&job.name);
+        let mut job = crate::nzb_core::nzb_parser::parse_nzb(&name, &data)
+            .map_err(|e| format!("parse failed: {e}"))?;
+        job.work_dir = self.queue_manager.incomplete_dir().join(&job.id);
+        job.output_dir = self.queue_manager.complete_dir().join(&job.name);
 
-                if let Err(e) = std::fs::create_dir_all(&job.work_dir) {
-                    error!(error = %e, "Failed to create work directory");
-                    return;
-                }
+        std::fs::create_dir_all(&job.work_dir)
+            .map_err(|e| format!("failed to create work directory: {e}"))?;
 
-                info!(name = %job.name, id = %job.id, "Auto-enqueuing NZB from watch dir");
-
-                if let Err(e) = self.queue_manager.add_job(job, Some(data)) {
-                    error!(error = %e, "Failed to enqueue NZB");
-                    return;
-                }
-
-                // Move processed file to avoid re-processing
-                let processed_dir = self.watch_dir.join("processed");
-                let _ = std::fs::create_dir_all(&processed_dir);
-                let dest = processed_dir.join(path.file_name().unwrap_or_default());
-                if let Err(_e) = std::fs::rename(path, &dest) {
-                    // If rename fails (cross-device), try copy+delete
-                    if let Err(e2) =
-                        std::fs::copy(path, &dest).and_then(|_| std::fs::remove_file(path))
-                    {
-                        warn!(error = %e2, "Failed to move processed NZB file");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, file = %path.display(), "Failed to parse NZB from watch dir");
-            }
-        }
+        info!(name = %job.name, id = %job.id, "Auto-enqueuing NZB from watch dir");
+        self.queue_manager
+            .add_job(job, Some(data))
+            .map_err(|e| format!("enqueue failed: {e}"))?;
+        Ok(())
     }
 
     fn read_limited(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -215,6 +287,47 @@ mod tests {
         assert!(DirWatcher::is_nzb_file(Path::new("release.nzb.gz")));
         assert!(!DirWatcher::is_nzb_file(Path::new("release.NZB")));
         assert!(!DirWatcher::is_nzb_file(Path::new("release.txt")));
+    }
+
+    #[tokio::test]
+    async fn waits_until_a_growing_file_stops_changing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("growing.nzb");
+        std::fs::write(&path, b"a").unwrap();
+
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            for _ in 0..8 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&writer_path)
+                    .unwrap();
+                std::io::Write::write_all(&mut file, b"a").unwrap();
+            }
+        });
+
+        let interval = std::time::Duration::from_millis(150);
+        assert!(DirWatcher::wait_until_stable(&path, interval).await);
+        writer.await.unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn settle_wait_reports_a_vanished_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let interval = std::time::Duration::from_millis(10);
+        assert!(!DirWatcher::wait_until_stable(&temp.path().join("gone.nzb"), interval).await);
+    }
+
+    #[test]
+    fn claimed_files_are_not_watched() {
+        assert!(!DirWatcher::is_nzb_file(Path::new(
+            "release.nzb.processing"
+        )));
+        assert!(!DirWatcher::is_nzb_file(Path::new(
+            "release.nzb.gz.processing"
+        )));
     }
 
     #[test]
