@@ -1,6 +1,6 @@
 [package]
 name = "nzb-postproc"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 description = "Post-processing pipeline: PAR2 verify/repair, archive extraction"
 license = "MIT"
