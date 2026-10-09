@@ -2337,17 +2337,24 @@ async fn run_worker_pipelined(
                             attempt = item.tries_on_current + 1,
                             "Transient pipeline error — re-queuing in-flight work and reconnecting: {e}"
                         );
-                        let is_auth = matches!(
-                            failure.kind,
-                            crate::article_failure::ArticleFailureKind::AuthFailed
-                                | crate::article_failure::ArticleFailureKind::PermissionDenied
-                        );
-                        pool.server_health
-                            .lock()
-                            .entry(primary_server.id.clone())
-                            .or_default()
-                            .record_failure(is_auth, &e.to_string());
-                        pool.report_provider_outage();
+                        // Only provider-level failures count against the
+                        // circuit breaker, as in the serial path. Article-level
+                        // answers (protocol errors such as 451, timeouts) are
+                        // capped per server by retry_or_fail_over; counting them
+                        // let a few bad articles pause the whole server.
+                        if counts_against_circuit_breaker(&e) {
+                            let is_auth = matches!(
+                                failure.kind,
+                                crate::article_failure::ArticleFailureKind::AuthFailed
+                                    | crate::article_failure::ArticleFailureKind::PermissionDenied
+                            );
+                            pool.server_health
+                                .lock()
+                                .entry(primary_server.id.clone())
+                                .or_default()
+                                .record_failure(is_auth, &e.to_string());
+                            pool.report_provider_outage();
+                        }
                         if retry_or_fail_over(
                             item,
                             primary_server,
@@ -2652,6 +2659,22 @@ fn all_enabled_providers_definitive(
         .iter()
         .filter(|server| server.enabled)
         .all(|server| outcomes.contains_key(&server.id))
+}
+
+/// Whether a fetch error says the provider itself is unhealthy, and so should
+/// count against its circuit breaker: connection/TLS, auth, permission and
+/// 502. Article-level answers never do.
+fn counts_against_circuit_breaker(e: &NntpError) -> bool {
+    matches!(
+        e,
+        NntpError::Connection(_)
+            | NntpError::Io(_)
+            | NntpError::Tls(_)
+            | NntpError::Auth(_)
+            | NntpError::AuthRequired(_)
+            | NntpError::PermissionDenied(_)
+            | NntpError::ServiceUnavailable(_)
+    )
 }
 
 /// Re-queue all in-flight items back to the work queue (on connection loss).
@@ -3628,5 +3651,29 @@ mod tests {
 
         assert_eq!(t.connected_snapshot(), vec![("srv1".into(), 0, 1)]);
         assert_eq!(t.snapshot(), vec![("srv1".into(), 1, 1)]);
+    }
+
+    #[test]
+    fn only_provider_level_errors_count_against_circuit_breaker() {
+        let s = || "x".to_string();
+        for e in [
+            NntpError::Connection(s()),
+            NntpError::Tls(s()),
+            NntpError::Auth(s()),
+            NntpError::AuthRequired(s()),
+            NntpError::PermissionDenied(s()),
+            NntpError::ServiceUnavailable(s()),
+        ] {
+            assert!(counts_against_circuit_breaker(&e), "{e}");
+        }
+        for e in [
+            NntpError::ArticleNotFound(s()),
+            NntpError::NoSuchGroup(s()),
+            NntpError::NoArticleSelected(s()),
+            NntpError::Protocol(s()),
+            NntpError::Timeout(s()),
+        ] {
+            assert!(!counts_against_circuit_breaker(&e), "{e}");
+        }
     }
 }
